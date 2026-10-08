@@ -1,0 +1,3 @@
+# Scenes created in the UI are stored here as a list.
+# `scene: !include scenes.yaml` in configuration.yaml is what makes HA load
+# them - without that line a UI-saved scene is written but never set up.

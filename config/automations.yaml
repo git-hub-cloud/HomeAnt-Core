@@ -1,0 +1,58 @@
+# =============================================================================
+# 音箱发现自动化
+#
+# 作用：扫描 xiaomi_home 为每台音箱创建的 notify 实体（"播放文本" action，
+#       entity_id 形如 notify.<did>_play_text_a_5_1），写入
+#       input_select.homeant_voice_speaker 的选项：
+#         - 只有一台音箱 -> 自动选中（零配置，用户无感）
+#         - 多台         -> 保持 "unset"，由 Agent 询问用户后调用
+#                           script__homeant_voice_select 选择
+#       选择记在 input_text.homeant_voice_speaker，本自动化补完选项后写回下拉
+#       （input_select 的 options 是运行时才补的，靠它自己恢复会被打回 unset）
+#
+# 触发：HA 启动 + 音箱列表变化（template trigger 比较渲染值，增删成员都会触发；
+#       本仓 HA 的 state trigger 不支持 domain 通配，故用 template）
+# ⚠️ 不写死任何 entity_id / did —— 全靠模板运行时发现，换机换音箱零维护
+# =============================================================================
+- id: homeant_voice_discover_speakers
+  alias: HomeAnt Voice Discover Speakers
+  trigger:
+    - platform: homeassistant
+      event: start
+    - platform: template
+      value_template: "{{ states.notify | map(attribute='entity_id') | select('search', '_play_text_a_') | list }}"
+  action:
+    - variables:
+        speakers: >-
+          {{ states.notify | map(attribute='entity_id')
+             | select('search', '_play_text_a_') | list }}
+        current: "{{ states('input_select.homeant_voice_speaker') }}"
+        saved: "{{ states('input_text.homeant_voice_speaker') }}"
+    - if:
+        - condition: template
+          value_template: "{{ speakers | length > 0 }}"
+      then:
+        - service: input_select.set_options
+          target:
+            entity_id: input_select.homeant_voice_speaker
+          data:
+            options: "{{ ['unset'] + speakers }}"
+        - if:
+            - condition: template
+              value_template: "{{ saved in speakers and saved != current }}"
+          then:
+            - service: input_select.select_option
+              target:
+                entity_id: input_select.homeant_voice_speaker
+              data:
+                option: "{{ saved }}"
+        - if:
+            - condition: template
+              value_template: "{{ speakers | length == 1 and current not in speakers }}"
+          then:
+            - service: input_select.select_option
+              target:
+                entity_id: input_select.homeant_voice_speaker
+              data:
+                option: "{{ speakers[0] }}"
+  mode: queued

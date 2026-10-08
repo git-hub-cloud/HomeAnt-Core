@@ -1,0 +1,10 @@
+{
+  "domain": "homeant_voice",
+  "name": "HomeAnt Voice",
+  "version": "1.0.0",
+  "documentation": "https://github.com/git-hub-cloud/HomeAnt-Core",
+  "codeowners": ["git-hub-cloud"],
+  "dependencies": [],
+  "after_dependencies": ["script"],
+  "requirements": []
+}

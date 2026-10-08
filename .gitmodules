@@ -1,0 +1,6 @@
+[submodule "core"]
+	path = core
+	url = https://github.com/git-hub-cloud/core.git
+[submodule "vendor/ha_xiaomi_home"]
+	path = vendor/ha_xiaomi_home
+	url = https://github.com/git-hub-cloud/ha_xiaomi_home.git

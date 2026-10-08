@@ -1,0 +1,18 @@
+#!/usr/bin/env sh
+# homeant — thin entry point (no suffix on purpose); all logic lives in scripts/homeant.py
+# Prerequisite: .venv must exist (created by `uv sync`)
+set -eu
+SELF_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
+# uv lays the venv out per platform: POSIX uses .venv/bin, Windows uses .venv/Scripts.
+# Git sh on Windows therefore has to look in both places.
+for REL in .venv/bin/python .venv/Scripts/python.exe; do
+  if [ -x "$SELF_DIR/$REL" ]; then
+    exec "$SELF_DIR/$REL" "$SELF_DIR/scripts/homeant.py" "$@"
+  fi
+done
+printf '[homeant] ERROR: no venv interpreter in .venv/bin or .venv/Scripts\n' >&2
+printf '[homeant] fix: run uv sync in %s\n' "$SELF_DIR" >&2
+if [ -n "${WINDIR:-}" ]; then
+  printf '[homeant] then use the native entry: .\\homeant.cmd %s\n' "$*" >&2
+fi
+exit 1

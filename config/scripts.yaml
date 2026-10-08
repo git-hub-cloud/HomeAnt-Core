@@ -1,0 +1,182 @@
+# =============================================================================
+# 小爱音箱语音播报（Agent -> MCP -> HA -> 小爱）
+#
+# 用法：任何 MCP client 调用工具 `script__homeant_voice`，参数 {text}
+#   触发方式 = 事件驱动：Agent 按 description 里的语义自行判断"这次回答值不值得播"
+#   ——仅任务完成、结论/摘要、提醒、告警才调用；纯对话、简单确认、追问一律不调用。
+#   text : 要朗读的内容。请先自行摘要至 300 字内。
+#          音箱单次上限 1024 字节（UTF-8）：纯中文约 341 字，含数字/字母可略多；
+#          超出部分被静默截断，超过 safe_len(341) 时返回里会带提示（见下方 result）。
+#
+# 首次使用 / 换音箱：
+#   播报返回"尚未设置默认音箱"时，候选列表就在错误信息里（区域+音箱名+
+#   entity_id，由模板函数 area_name()/device_name() 运行时渲染，零硬编码）
+#   —— 让用户选一个，然后调用 `script__homeant_voice_select`
+#   （参数 speaker=候选 entity_id）。
+#   选择结果落盘 .storage/input_select，重启不丢。只有一台音箱时
+#   automations.yaml 的发现自动化会自动选中，无需任何交互。
+#   之后想换音箱，随时可再调 homeant_voice_select（无需先失败一次）。
+#
+# 原理：HA 原生 script 组件会把每个"暴露的"脚本自动注册成 MCP 工具
+#       （core/homeassistant/components/script/llm.py 的 ScriptTool/ActionTool），
+#       因此无需自建集成即可让通用 Agent 获得"让小爱说话"的能力。
+#       homeant_voice 组件负责把这两个脚本 expose 给 Assist。
+#
+# 依赖：xiaomi_home 集成的 notify 实体（siid=5 aiid=1 的"播放文本" action）。
+#       该实体由 xiaomi_home 在检测到 action 有入参时自动创建
+#       （miot_device.py 724-734），**不需要开 action_debug**（那只影响 text.* 实体）。
+#
+# ⚠️ notify 的 message 必须是 YAML/JSON 列表：单入参 -> ["文本"]。
+#    用 [text] | tojson 生成，天然避开 YAML 特殊字符（冒号/#/前导- 等）。
+#
+# ⚠️ 本文件不含任何环境相关数据（音箱 entity_id / did / 房间映射）——
+#    全部由 input_select.homeant_voice_speaker 运行时承载，发现逻辑见
+#    automations.yaml 的 homeant_voice_discover_speakers。
+#
+# ⚠️ 失败语义：可预期的失败一律用 `variables.result` + 不带 error 的 `stop`
+#    + `response_variable: result` 把结论回传给调用方。
+#    **result 必须是 dict**（服务响应只接受 dict，返回字符串会报
+#    service_reponse_invalid），本文件统一用 {status, message}。
+#    不要用 `stop` + `error: true`：顶层脚本会吞掉它，调用方只收到空 {}，
+#    既拿不到文案也收不到错误。只有真异常（服务失败 / 模板错）才会冒成错误。
+#    也不做可用性预检（省一次往返）。
+# =============================================================================
+homeant_voice:
+  # alias 决定 entity_id（HA 2025.10 用 alias 生成）→ 工具名
+  # script__homeant_voice。⚠️ 跨环境契约：alias 必须保持 HomeAntVoice
+  # （homeant_voice 组件靠 friendly_name 发现并 expose 本脚本）
+  alias: HomeAntVoice
+  description: |
+    通过小爱音箱把一段文字朗读出来（TTS 语音播报）。
+    调用时机（事件驱动，无自动模式/总开关）：仅当本次回答包含任务完成通知、
+    结论或摘要、提醒、告警时才调用本工具；纯对话、简单确认、追问、闲聊
+    一律不调用。是否调用由你按上述语义自行判断。
+    内容要求：先自行摘要至 300 字以内再传入（音箱单次上限 1024 字节，纯中文
+    约 341 字，超出部分会被截断，返回里会带提示）。
+    不要用它执行设备控制指令（那应该用 HassTurnOn / HassLightSet 等工具）。
+    返回值（必读）：{"result": {"status": ..., "message": ...}}，按 status 处理：
+      ok         —— 真的播出去了，message 里是字数（超长会提示被截断）；
+      no_speaker —— 尚未设置默认音箱。把 message 里的候选（区域+音箱名+
+                    entity_id）念给用户、让用户选一台，再调 homeant_voice_select，
+                    之后永久生效；
+      empty      —— text 为空，重新摘要后再调一次；
+      no_device  —— 未发现可播报的小爱音箱，按 message 提示让用户查音箱/集成；
+      unknown    —— 脚本被中断，不确定播没播，要如实告诉用户。
+    用户随时要求"换一个音箱播报"时，直接再调 homeant_voice_select。
+  icon: mdi:text-to-speech
+  # queued = 排队不丢消息。⚠️ 未测：连续两次播文本，音箱是排队还是后者打断前者
+  mode: queued
+  fields:
+    text:
+      name: 播报内容
+      description: 要朗读的纯文本；请先自行摘要至 300 字内（纯中文超过约 341 字会被截断）
+      required: true
+      selector:
+        text:
+  variables:
+    # 音箱单次上限 1024 字节：纯中文 341 字（1023 字节）念完、342 字（1026 字节）被截断。
+    # 341 是提示线，不是拦截线（脚本不截断，超了由音箱自己丢尾部）
+    safe_len: 341
+  sequence:
+    - variables:
+        # UI 下拉优先；它未选中（unset/unknown…）时回落到持久记录 input_text
+        speaker: >-
+          {{ states('input_select.homeant_voice_speaker')
+             if states('input_select.homeant_voice_speaker') not in ['unset', 'unknown', 'unavailable', 'none', '']
+             else states('input_text.homeant_voice_speaker') }}
+        speakers: "{{ states.notify | map(attribute='entity_id') | select('search', '_play_text_a_') | list }}"
+        text_len: "{{ text | length }}"
+        # 兜底初值：保证尾部 stop 的 response_variable 恒有值
+        result:
+          status: unknown
+          message: "脚本未按预期走到分支，可能被中断，不要当成已播报。"
+    - if:
+        - condition: template
+          value_template: "{{ speaker not in ['unset', 'unknown', 'unavailable', 'none', ''] }}"
+      then:
+        - if:
+            - condition: template
+              value_template: "{{ text_len > 0 }}"
+          then:
+            - service: notify.send_message
+              target:
+                entity_id: "{{ speaker }}"
+              data:
+                message: "{{ [text] | tojson }}"
+            - variables:
+                result:
+                  status: ok
+                  message: "已通过小爱音箱播报，共 {{ text_len }} 字{% if text_len > safe_len %}；⚠️ 超过 {{ safe_len }} 字，纯中文文本已越过音箱 1024 字节上限，尾部可能被截断——下次请先摘要至 300 字内{% endif %}"
+          else:
+            - variables:
+                result:
+                  status: empty
+                  message: "text 为空，没有可朗读的文字。请传入 1~300 字纯文本后重试。"
+            - stop: "播报内容为空"
+              response_variable: result
+      else:
+        - if:
+            - condition: template
+              value_template: "{{ speakers | length > 0 }}"
+          then:
+            - variables:
+                result:
+                  status: no_speaker
+                  message: >-
+                    尚未设置默认音箱。可用候选：{% for eid in speakers %}{{ area_name(eid) or '未分区' }}的{{ device_name(eid) or eid }}（{{ eid }}）{% if not loop.last %}；{% endif %}{% endfor %}。请询问用户选哪一台，然后调用 HomeAntVoiceSelect 传入对应 entity_id（一次即可，之后永久生效）。
+            - stop: "未设置默认音箱"
+              response_variable: result
+          else:
+            - variables:
+                result:
+                  status: no_device
+                  message: "未发现可播报的小爱音箱。请确认 xiaomi_home 集成已配置、音箱已通电联网（其 notify 实体名需含 _play_text_a_）。"
+            - stop: "未发现可播报的小爱音箱"
+              response_variable: result
+    - stop: "播报完成"
+      response_variable: result
+
+homeant_voice_select:
+  # ⚠️ 跨环境契约：alias 必须保持 HomeAntVoiceSelect（组件 expose 用）
+  alias: HomeAntVoiceSelect
+  description: |
+    设置或更换小爱音箱播报的默认目标。
+    两种调用场景：① homeant_voice 返回"尚未设置默认音箱"时，把用户选择的
+    音箱 entity_id 传入（必须来自失败信息里列出的候选）；② 用户随时要求
+    "换一个音箱播报"时，直接传入新的候选 entity_id。
+    设置立即生效并落盘，后续播报无需再选，重启不丢。
+  icon: mdi:speaker-message
+  mode: single
+  fields:
+    speaker:
+      name: 音箱
+      description: 候选列表中的音箱 entity_id（形如 notify.xxx_play_text_a_5_1）
+      required: true
+      selector:
+        text:
+  sequence:
+    - variables:
+        label: "{{ (area_name(speaker) or '未分区') }}的{{ device_name(speaker) or speaker }}"
+    # 先写持久记录（input_text 无 options 约束，一定成功）
+    - service: input_text.set_value
+      target:
+        entity_id: input_text.homeant_voice_speaker
+      data:
+        value: "{{ speaker }}"
+    # 再同步 UI 下拉；候选此刻还没被发现到就跳过，不影响记忆
+    - if:
+        - condition: template
+          value_template: "{{ speaker in (state_attr('input_select.homeant_voice_speaker', 'options') or []) }}"
+      then:
+        - service: input_select.select_option
+          target:
+            entity_id: input_select.homeant_voice_speaker
+          data:
+            option: "{{ speaker }}"
+    # 必须回传结果，否则调用方拿不到结论（且响应必须是 dict）
+    - variables:
+        result:
+          status: ok
+          message: "已将默认音箱设为 {{ label }}（{{ speaker }}），后续播报无需再选。"
+    - stop: "默认音箱已设置"
+      response_variable: result

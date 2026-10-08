@@ -1,0 +1,36 @@
+node_modules/
+.DS_Store
+dist/
+.env
+.env.local
+*.log
+.vscode/
+.idea/
+__pycache__/
+*.pyc
+.next/
+coverage/
+TODO.md
+
+# Python virtualenv
+.venv/
+venv/
+.env/
+
+# uv cache
+.ruff_cache/
+
+# project-local tool binaries
+.tools/
+.mypy_cache/
+.pytest_cache/
+
+# OS
+Thumbs.db
+desktop.ini
+
+.workbuddy/
+
+# live user config: created from homeant.cfg.default on the first start.
+# Only the template is tracked; a live file holds passwords and per-machine paths.
+homeant.cfg

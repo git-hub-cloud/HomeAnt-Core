@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "minor_version": 5,
+  "key": "core.config_entries",
+  "data": {
+    "entries": [
+      {
+        "created_at": "2026-10-17T00:00:00.000000+00:00",
+        "data": {
+          "all_llm_apis": true,
+          "llm_hass_api": [],
+          "require_admin": false,
+          "read_only": false
+        },
+        "disabled_by": null,
+        "discovery_keys": {},
+        "domain": "mcp_server",
+        "entry_id": "homeant-mcp-server",
+        "minor_version": 4,
+        "modified_at": "2026-10-17T00:00:00.000000+00:00",
+        "options": {},
+        "pref_disable_new_entities": false,
+        "pref_disable_polling": false,
+        "source": "user",
+        "subentries": [],
+        "title": "All LLM APIs",
+        "unique_id": null,
+        "version": 1
+      }
+    ]
+  }
+}

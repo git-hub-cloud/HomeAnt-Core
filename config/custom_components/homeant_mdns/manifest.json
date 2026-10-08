@@ -1,0 +1,10 @@
+{
+  "domain": "homeant_mdns",
+  "name": "HomeAnt mDNS",
+  "version": "1.0.0",
+  "documentation": "https://github.com/git-hub-cloud/HomeAnt-Core",
+  "codeowners": ["git-hub-cloud"],
+  "dependencies": ["zeroconf"],
+  "after_dependencies": ["zeroconf"],
+  "requirements": []
+}

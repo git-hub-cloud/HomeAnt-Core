@@ -1,0 +1,35 @@
+# =============================================================================
+# HomeAnt - Default HA config
+#
+# Deployed by './homeant start' (Linux/macOS) or '.\homeant start' (Windows) into ~/.homeant/.
+# User-owned - if the target file already exists, it is NOT overwritten.
+# =============================================================================
+
+homeassistant:
+  language: zh-Hans
+  country: CN
+  time_zone: Asia/Shanghai
+webhook:            # OAuth / cloud callbacks
+zeroconf:           # hard dependency of homeant_mdns and xiaomi_home
+conversation:       # mcp_server deps: http + conversation -> intent + llm
+                    # (llm registers the "assist" API that /api/mcp serves)
+recorder:           # database behind history / logbook
+history:            # history of states
+logbook:            # logbook of events
+homeant_mdns:       # mdns discovery of HomeAnt devices
+homeant_voice:      # HomeAnt voice speaker
+input_select:       # UI 下拉：候选由 homeant_voice_discover_speakers 运行时填充
+  homeant_voice_speaker:
+    name: HomeAnt Voice Speaker
+    options:
+      - unset
+input_text:         # 已选音箱的持久记录。input_select 的 options 是启动后才补的，
+                    # 恢复态时选项还不存在 → 会被打回 unset，所以选择存在这里
+  homeant_voice_speaker:
+    name: HomeAnt Voice Speaker (saved)
+automation: !include automations.yaml
+script: !include scripts.yaml
+scene: !include scenes.yaml
+# logger:
+#   logs:
+#     custom_components.xiaomi_home: debug

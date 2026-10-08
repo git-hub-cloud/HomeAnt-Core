@@ -1,0 +1,35 @@
+# ═══════════════════════════════════════════════════════════════════
+#  HomeAnt — User Config
+#  Rule: KEY=VALUE. No prefix = HomeAnt core; plugin params prefixed
+#
+#  Two files, same keys:
+#    homeant.cfg          the LIVE config — edit this one
+#    homeant.cfg.default  the TEMPLATE shipped in the release zip
+#
+#  `start` copies the template when no live file exists yet, and re-reads it
+#  on every upgrade to append keys a newer version added. The template is
+#  replaced by every upgrade, so changes made to it are lost; the live file
+#  is never replaced — the values you set there survive.
+# ═══════════════════════════════════════════════════════════════════
+
+# ── HomeAnt core (required, edit before first run) ──
+# admin = HA owner (system-admin). Created offline into .storage/auth by
+# `homeant start` while hass is stopped, and it is the only account this
+# tool creates: the same login drives the Xiaomi OAuth flow and owns the MCP
+# token (.mcp-token in HA_ROOT — that token carries admin rights, is written
+# 0600, and is only ever printed for you to paste into your client).
+# Provisioning is append-only: changing PASSWORD here later does NOT update it
+# — use `.venv\Scripts\hass --ignore-os-check --script auth -c %USERPROFILE%\.homeant
+# change_password <username> <new-pw>` with hass stopped.
+USERNAME=admin
+PASSWORD=homeant
+
+# ── Xiaomi Home plugin (XIAOMI_ prefix, auto-filled by homeant) ──
+# Accept EULA (true = skip the EULA step)
+XIAOMI_EULA=true
+# Cloud server: cn / de / ru / us / tw / sg
+XIAOMI_CLOUD_SERVER=cn
+# Integration language: zh-Hans / en / de / fr / ja / ...
+XIAOMI_LANGUAGE=zh-Hans
+# Network dependency check (true = homeant pings external endpoints)
+XIAOMI_NETWORK_DETECT=true
