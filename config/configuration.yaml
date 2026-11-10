@@ -18,18 +18,23 @@ history:            # history of states
 logbook:            # logbook of events
 homeant_mdns:       # mdns discovery of HomeAnt devices
 homeant_voice:      # HomeAnt voice speaker
-input_select:       # UI 下拉：候选由 homeant_voice_discover_speakers 运行时填充
+input_select:       # UI dropdown; options filled at runtime by homeant_voice_discover_speakers
   homeant_voice_speaker:
     name: HomeAnt Voice Speaker
     options:
       - unset
-input_text:         # 已选音箱的持久记录。input_select 的 options 是启动后才补的，
-                    # 恢复态时选项还不存在 → 会被打回 unset，所以选择存在这里
+input_text:         # Persistent record of the chosen speaker. input_select's
+                    # options are filled only after startup, so on restore its
+                    # saved value has no matching option and falls back to unset.
   homeant_voice_speaker:
     name: HomeAnt Voice Speaker (saved)
 automation: !include automations.yaml
 script: !include scripts.yaml
 scene: !include scenes.yaml
-# logger:
-#   logs:
-#     custom_components.xiaomi_home: debug
+logger:
+  # macOS: the uv python has no local-network permission, so HA core's
+  # zeroconf socket logs a harmless "Errno 65 No route to host" at startup.
+  # Our records are published by dns-sd there, so silence the library logger.
+  # This does not affect custom_components.homeant_mdns (a different logger).
+  logs:
+    zeroconf: critical

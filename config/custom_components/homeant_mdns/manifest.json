@@ -6,5 +6,6 @@
   "codeowners": ["git-hub-cloud"],
   "dependencies": ["zeroconf"],
   "after_dependencies": ["zeroconf"],
+  "loggers": ["custom_components.homeant_mdns"],
   "requirements": []
 }

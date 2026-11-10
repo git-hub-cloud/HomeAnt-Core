@@ -28,6 +28,10 @@ $TransferTimeoutSec    = 600
 # number is HASS_STOP_WAIT_SEC in install.sh: both installers stop the same
 # instance, so "still alive" must start being true at the same moment.
 $HassStopWaitSec       = 20
+# The SCM registration this project installs.  Same name as SERVICE_NAME in
+# homeant.py and as the unit name in install.sh: one service, one name, and the
+# three files must agree on it.
+$ServiceName           = "homeant"
 
 function _info($m) { Write-Host "[install] $m" }
 function _err($m)  { Write-Host "[install] $m" -ForegroundColor Red }
@@ -241,7 +245,61 @@ function _extract_here($zipPath, $destDir) {
     }
 }
 
+function _is_admin {
+    # Is this process elevated?  Only used to *say* what is missing: the
+    # installer never elevates itself, because a UAC dialog cannot be answered
+    # by an unattended run and a re-launched install would change which account
+    # owns the files.
+    $id = [Security.Principal.WindowsIdentity]::GetCurrent()
+    (New-Object Security.Principal.WindowsPrincipal($id)).IsInRole(
+        [Security.Principal.WindowsBuiltInRole]::Administrator)
+}
+
+function _stop_service {
+    # Since T9 the SCM is the only thing that starts hass on Windows, so one
+    # Stop-Service replaces the pid hunt whenever a registration exists.
+    # Deliberately "stop" and not "set to demand start": an upgrade must not
+    # change whether this home comes back after a reboot.
+    #
+    # Returns $true when a registration exists - running or not - so the caller
+    # knows the pid tier below has nothing left to do.  $false means no
+    # registration, which is either a fresh install or a tree from before T9
+    # whose hass was spawned directly; that second case still needs the hunt.
+    $svc = Get-Service -Name $ServiceName -ErrorAction SilentlyContinue
+    if (-not $svc) { return $false }
+    if ($svc.Status -eq 'Stopped') {
+        _info "homeant service is stopped"
+        return $true
+    }
+    # Worded exactly as install.sh says it: same rule, same report.
+    _info "homeant service is running - stopping it before uv sync"
+    try {
+        Stop-Service -Name $ServiceName -Force -ErrorAction Stop
+    } catch {
+        _info "could not stop the homeant service - uv sync may fail"
+        return $true
+    }
+    try { $svc.WaitForStatus('Stopped', [TimeSpan]::FromSeconds($HassStopWaitSec)) } catch {
+        # WaitForStatus throws on timeout; the status check below is the verdict.
+    }
+    if ((Get-Service -Name $ServiceName -ErrorAction SilentlyContinue).Status -ne 'Stopped') {
+        _info "service still active after ${HassStopWaitSec}s - uv sync may fail"
+    } else {
+        _info "service stopped"
+    }
+    return $true
+}
+
 function _stop_hass {
+    # Tier 1: the service.  A registration means the SCM owns hass, and killing
+    # that process behind the manager's back would look like a crash and pull it
+    # straight back into the tree uv sync is replacing.
+    if (_stop_service) { return }
+
+    # Tier 2 (pre-T9 trees only): a hass that no SCM knows about, started
+    # directly by a build that had no service.  Deleted together with the pid
+    # tier it belongs to once `start` refuses to leave anything unsupervised.
+    #
     # Stop the Home Assistant tree that this install owns, before uv sync.
     #
     # One record: HA's own HA_ROOT\.ha_run.lock ({"pid": N, ...}).  homeant
@@ -428,6 +486,16 @@ function main() {
     # worth nothing to discover three minutes later.
     _preflight $here
 
+    # Registering the service is the one step here that needs administrator
+    # rights, and nothing in this file elevates: a UAC dialog cannot be answered
+    # by an unattended run, and re-launching the install under another account
+    # would leave the files owned by it.  So the limit is said once, now, rather
+    # than being discovered by the last line of the install.
+    if (-not (_is_admin) -and -not (Get-Service -Name $ServiceName -ErrorAction SilentlyContinue)) {
+        _info "note: starting at boot needs the Windows service, and registering it needs administrator rights"
+        _info "      after this finishes, run once from an elevated prompt: .\homeant start"
+    }
+
     # ============================================================
     # download HomeAnt source
     # ============================================================
@@ -547,6 +615,12 @@ function main() {
     # Those are not in uv.lock, so the default exact sync deletes them and the
     # next boot spends ~30s putting 288 MB back. Versions covered by the lock
     # are still aligned exactly - only extraneous packages are left alone.
+    # No --python here, on purpose. The interpreter is pinned in exactly one
+    # place - requires-python in pyproject.toml, ">=3.14.2,<3.15" - and uv
+    # enforces it on every entry point: a mismatching UV_PYTHON, a --python flag
+    # or a stale .python-version is a hard error, never a silent build from
+    # source. A version literal repeated here could only drift out of step with
+    # that one source. Keep this identical to install.sh: same reason, same text.
     _info "uv sync ..."
     & $uvCmd sync --inexact --link-mode=copy
     if ($LASTEXITCODE -ne 0) { _fatal "uv sync FAILED" }
@@ -601,13 +675,15 @@ function main() {
     # SUCCESS / PENDING / FAIL line - the three-way distinction is for the
     # reader - and folds SUCCESS and PENDING into the same code, so there is no
     # state vocabulary to keep in sync between the two files. A step left for a
-    # human is not an install failure: the files are in place and the service is
-    # up, and re-running is the retry. Reporting it as FAILED is how a good
-    # install gets reinstalled in a loop that ends the same way.
+    # human is not an install failure: the files are in place, the missing piece
+    # is on the line above, and re-running `homeant start` is the retry.
+    # Reporting it as FAILED is how a good install gets reinstalled in a loop
+    # that ends the same way - so say what is actually wrong and what to do, and
+    # keep rc=1 for the automation that only reads the exit code.
     & .\homeant start --no-install
     $startRc = $LASTEXITCODE
     if ($startRc -ne 0) {
-        _fatal "FAILED"
+        _fatal "start did not finish - fix the line above, then re-run: .\homeant start"
     }
 } # end main
 

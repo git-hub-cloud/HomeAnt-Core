@@ -37,10 +37,9 @@ From then on everything goes through the `homeant` command in `~/homeant`:
 
 `homeant start` auto-installs `uv` (project-local at `.tools/uv/`, never
 global), runs `uv sync`, deploys config files and starts Home Assistant. The
-post-start work runs as three gated stages — hosts (WSL only), Xiaomi OAuth,
-MCP config — and an unsatisfied stage stops the run without doing the next one;
-re-running `homeant start` re-checks everything and resumes where you left
-off. Each run ends with `SUCCESS` / `PENDING` / `FAIL`; the MCP config block
+post-start work runs as three gates — hosts on WSL only, Xiaomi OAuth, MCP
+config — and an unsatisfied gate stops the run without doing the next one;
+re-running `homeant start` re-checks everything and resumes where you left off. Each run ends with `SUCCESS` / `PENDING` / `FAIL`; the MCP config block
 opens the final `SUCCESS` block, so nothing scrolls past what you copy. If the
 source tree is incomplete (missing `core/` or `vendor/`), the online installer
 auto-downloads the full package and overwrites — no manual submodule init, no
@@ -52,22 +51,12 @@ All control commands go through `homeant`:
 
 | Command   | What it does                                                    |
 |-----------|-----------------------------------------------------------------|
-| `start`   | Bring the install up to date, then start Home Assistant          |
-| `stop`    | Stop Home Assistant                                             |
+| `start`   | Bring the install up to date, then start Home Assistant (this also turns autostart on) |
+| `stop`    | Stop Home Assistant now; autostart is untouched, so it comes back at the next boot |
+| `disable` | Turn autostart off; the running home keeps running (`start` turns it back on) |
 | `status`  | Health check + paste-ready MCP config block                     |
 | `logs`    | Stream Home Assistant logs in real time                         |
-
-```powershell
-# Windows
-.\homeant status
-.\homeant logs
-```
-
-```sh
-# Linux / macOS
-./homeant status
-./homeant logs
-```
+| `uninstall` | Stop, remove the service registration (and autostart), delete `~/.homeant` |
 
 ## Connect an AI agent over MCP
 
@@ -104,12 +93,12 @@ On the first `start`, the script:
 
 1. Deploys preconfigured HA config into `~/.homeant/`
 2. Boots Home Assistant and waits for the core to report running
-3. Runs three gated stages — each one must pass before the next runs:
+3. Runs three gates; a failing gate stops the run before the next one:
 
 | Stage | WSL | Windows / Linux / macOS |
 |---|---|---|
-| 1 hosts | reads the Windows hosts file, requires `127.0.0.1 homeassistant.local HomeAnt.local` (one line, both names); missing → prints the PowerShell line and stops | skipped — the server itself never needs to resolve these names. Clients resolve them via mDNS (Windows/macOS natively; Linux needs `libnss-mdns`), or fall back to the server's LAN IP |
-| 2 OAuth | starts the `xiaomi_home` flow, prints the full OAuth URL for the Windows browser, stops | starts the flow, opens the browser, stops — a headless Linux box has no `DISPLAY`/`WAYLAND_DISPLAY`, so it prints the URL instead of launching a console browser |
+| 1 hosts | reads the Windows hosts file, requires `127.0.0.1 homeassistant.local HomeAnt.local` (one line, both names); missing → prints the PowerShell line and stops. No networking mode is exempt | skipped — the server itself never needs to resolve these names. Clients resolve them via mDNS (Windows/macOS natively; Linux needs `libnss-mdns`), or fall back to the server's LAN IP |
+| 2 OAuth | starts the `xiaomi_home` flow, prints the full OAuth URL for the Windows browser, stops | starts the flow, opens the browser, stops — a headless Linux box has no `DISPLAY`/`WAYLAND_DISPLAY`, and a Windows service has no Session-0 desktop, so both print the URL instead |
 | 3 MCP | prints the ready-to-paste MCP config, always last | same |
 
 Nothing ever waits for the browser. Stage 2 leaves the flow pending and returns

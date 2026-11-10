@@ -3,8 +3,8 @@
 HomeAnt host control — cross-platform (Windows / Linux / macOS).
 
 Usage (platform entry points):
-  Windows:   .\\homeant    start|stop|status|logs
-  Linux/mac: ./homeant     start|stop|status|logs
+  Windows:   .\\homeant    start|stop|status|logs|uninstall
+  Linux/mac: ./homeant     start|stop|status|logs|uninstall
 
 Config: project_root/homeant.cfg
 
@@ -53,8 +53,8 @@ HA_ROOT = Path.home() / ".homeant"
 #
 # There used to be a second one, .hass.pid, written by us right after Popen.
 # It is gone.  Its only irreplaceable job was holding a pid during the ~8s a new
-# hass needs to finish importing before HA writes its own, and _ha_instance's
-# process scan covers that window.  Keeping both meant two records that could
+# hass needs to finish importing before HA writes its own, and a process scan
+# used to cover that window.  Keeping both meant two records that could
 # disagree — and they did: with HA_ROOT deleted while hass was still running,
 # start found the process by scanning and reported it running while status, left
 # with a deleted pid file, reported it stopped.  On Windows they never even held
@@ -67,15 +67,20 @@ HA_ROOT = Path.home() / ".homeant"
 # and we must not probe that lock — HA takes LOCK_EX non-blocking exactly once
 # at startup, so a probe of ours could make a healthy HA abort.
 #
-# When the lock file cannot answer (missing, unreadable, truncated, or holding a
-# pid that has died or been recycled), _ha_instance falls back to
-# _scan_hass_process: a scan for a command line that carries both "--config" and
-# HA_ROOT.  That is the last tier, not the first, because a scan costs a CIM
-# query on Windows and can only ever guess what the lock file knows for certain.
-# Missing is deliberately part of "cannot answer": a fresh install pays one scan
-# and finds nothing, which is cheaper than never being able to stop an instance
-# whose records were deleted.
-HA_LOCK_FILE = HA_ROOT / ".ha_run.lock"
+# T11 deleted the third tier that used to sit under this file: a process-table
+# scan matching every command line that carried both "--config" and HA_ROOT.  It
+# was a guess — a `bash -c "... hass ... --config ..."` wrapper carries the same
+# words, so that shell came back as a hit one pid ahead of the hass it launched
+# — and on Windows it cost a PowerShell start-up (~1s) on a path `status` walks.
+# What replaced it is not a cheaper scan but a different question:
+# `_hass_via_service()` asks the supervisor whether its process is alive and the
+# socket whether anything answers.  Once a service owns the home that is what
+# "up" means, and it cannot be fooled by text.  The pid itself stays lock-only;
+# when the lock is gone, `status` says "running (via service)" and stops there.
+# No HA_LOCK_FILE constant on purpose: the lock lives *inside* HA_ROOT, and a
+# module-level copy silently keeps pointing at the old root the moment anything
+# rebases HA_ROOT (tests do; a future --ha-root would).  Deriving it at the one
+# call site costs nothing and cannot drift.
 HASS_LOG = HA_ROOT / "home-assistant.log"
 SEED_MARKER = HA_ROOT / ".seed-state"
 HOMEANT_SERVER = os.environ.get("HOMEANT_SERVER") or "dl.homeant.cn"
@@ -210,7 +215,10 @@ def log_tick() -> None:
     print(".", end="", flush=True)
 
 
-_COLOR = sys.stdout.isatty()
+# ``sys.stdout`` is None in a Windows service — Session 0 has no console — and
+# an unguarded isatty() would raise AttributeError at import time, i.e. before
+# `--service-host` can even say why it died.
+_COLOR = bool(sys.stdout and sys.stdout.isatty())
 
 
 def log_red(msg: str) -> None:
@@ -268,7 +276,8 @@ def pid_exists(pid: int) -> bool:
         # decode as UTF-8 and leave stdout=None. Pin the preferred encoding.
         r = subprocess.run(
             ["tasklist", "/FI", f"PID eq {pid}"], capture_output=True, text=True,
-            encoding=locale.getpreferredencoding(False), errors="ignore")
+            encoding=locale.getpreferredencoding(False), errors="ignore",
+            creationflags=_no_console_flags())
         return r.stdout is not None and str(pid) in r.stdout
     try:
         os.kill(pid, 0)
@@ -320,7 +329,8 @@ def _pid_is_hass(pid: int) -> bool:
         r = subprocess.run(
             ["tasklist", "/FI", f"PID eq {pid}", "/FO", "CSV", "/NH"],
             capture_output=True, text=True,
-            encoding=locale.getpreferredencoding(False), errors="ignore")
+            encoding=locale.getpreferredencoding(False), errors="ignore",
+            creationflags=_no_console_flags())
         image = (r.stdout or "").lower()
         # HA records the real python child's pid, not the hass.exe trampoline's.
         return "hass" in image or "python" in image
@@ -334,103 +344,62 @@ def _pid_is_hass(pid: int) -> bool:
     return _cmdline_is_hass(raw.replace(b"\x00", b" ").decode("utf-8", "replace"))
 
 
-def _scan_hass_process() -> int | None:
-    """Find the HA that serves HA_ROOT by looking at processes, not at files.
+def _ha_instance() -> int | None:
+    """PID of the HA that owns HA_ROOT, or None when no pid can be named.
 
-    Reached whenever .ha_run.lock cannot answer: it is missing, unreadable or
-    truncated, or the pid inside has died or been recycled onto something that
-    is not hass.  Missing counts — the records are plain files and can be
-    deleted while hass keeps running, and then this scan is the only thing left
-    that can find it.
+    The pid comes from one place only: ``.ha_run.lock``, which HA writes itself
+    with ``os.getpid()``.  That makes it the one authoritative answer — it is
+    the process talking about itself, not us guessing from a command line.
 
-    On Windows the answer is usually python.exe: hass.exe is only the launcher
-    and it forwards --config to the child.  When the launcher shows up too it is
-    preferred, because `taskkill /T` on it reaps the child in one call.
+    T11 removed the fallback that scanned the process table whenever this file
+    was missing or held a stale pid.  Two reasons: on Windows it started a
+    PowerShell (~1s) on a path `status` walks, and matching on argv text is a
+    guess — a ``bash -c "... hass ... --config ..."`` wrapper carries the same
+    words.  The caller that needs "is it up at all" asks ``_hass_via_service()``
+    instead, which asks the supervisor and the socket rather than the text.
+
+    None therefore means "cannot name it", not "provably not running".
     """
-    if IS_WIN:
-        # No tasklist field exposes the command line, so this has to go through
-        # CIM (costs a PowerShell start-up, ~1s).  Acceptable on a rare path —
-        # and stop has to wait for the process to disappear anyway.  The filter
-        # only narrows by image name; matching happens back in Python so both
-        # platforms use one rule.
-        ps = (
-            "Get-CimInstance Win32_Process "
-            "-Filter \"Name='python.exe' OR Name='hass.exe'\" | "
-            "ForEach-Object { '{0}|||{1}|||{2}' -f $_.ProcessId, $_.Name, $_.CommandLine }"
-        )
-        try:
-            r = subprocess.run(
-                ["powershell", "-NoProfile", "-NonInteractive", "-Command", ps],
-                capture_output=True, text=True, timeout=15,
-                encoding=locale.getpreferredencoding(False), errors="ignore")
-        except (OSError, subprocess.SubprocessError):
-            return None
-        found: list[tuple[int, str]] = []
-        for line in (r.stdout or "").splitlines():
-            parts = line.split("|||")
-            if len(parts) >= 3 and parts[0].strip().isdigit():
-                if _cmdline_is_hass(parts[2]):
-                    found.append((int(parts[0]), parts[1].strip().lower()))
-        for pid, image in found:
-            if "hass" in image:
-                return pid
-        return found[0][0] if found else None
-
     try:
-        entries = list(Path("/proc").iterdir())
-    except OSError:
-        return None   # no /proc (macOS): nothing to scan, stay honest
-    me = os.getpid()
-    for entry in entries:
-        if not entry.name.isdigit() or int(entry.name) == me:
-            continue
-        pid = int(entry.name)
-        # Image name first.  `bash -c "... hass ... --config <root> ..."` carries
-        # the exact same words in its own argv (measured: the wrapper shell came
-        # back as a hit, one pid ahead of the dummy hass it was running), and
-        # killing the shell that launched hass is worse than missing hass.
-        image = _proc_image(pid)
-        if image and not (image.startswith("python") or "hass" in image):
-            continue
-        try:
-            raw = (entry / "cmdline").read_bytes()
-        except OSError:
-            continue
-        if _cmdline_is_hass(raw.replace(b"\x00", b" ").decode("utf-8", "replace")):
-            return pid
+        info = json.loads((HA_ROOT / ".ha_run.lock").read_text(encoding="utf-8") or "{}")
+        pid = int(info.get("pid") or 0)
+    except (OSError, ValueError, TypeError, AttributeError):
+        # Missing, unreadable, truncated or not JSON.  The lock can be gone
+        # while hass keeps running — deleted by hand, by a cleanup tool, or by a
+        # `git clean` in the wrong directory — so this is not "not running".
+        return None
+    if pid > 0 and pid_exists(pid) and _pid_is_hass(pid):
+        return pid
+    # The lock outlives every instance (runner.py never unlinks it), so a dead
+    # or recycled pid says nothing about what is running now — least of all on
+    # Windows, where fcntl is None and HA's own single-instance lock is inert.
     return None
 
 
-def _ha_instance() -> int | None:
-    """PID of the HA that owns HA_ROOT, or None when there provably is none.
+def _hass_via_service() -> bool:
+    """True when a supervisor owns a live instance, even though no pid is known.
 
-    The single authority for "is an instance running": callers no longer keep a
-    pid file of their own, so every command asks this one question and gets one
-    answer.  It sees instances nothing else can — started by hand, or by an
-    earlier run whose records were deleted — which is what keeps `start` from
-    launching a second hass that dies on HA's single-instance lock while
-    ``_hass_serving()`` answers from the old one.
+    hass is the supervisor's *grandchild* — Windows: service host →
+    ``start --foreground`` → hass; Linux: MainPID (also ``start --foreground``)
+    → hass — so neither manager will name it.  T11 deleted the process-table
+    scan that used to guess, so this is what "it is up" means when the lock
+    cannot say who: the supervisor reports its process alive **and** something
+    is bound to the one port this home uses.
+
+    Two questions on purpose.  "Active but nothing listening" is a real state
+    (hass still importing, or wedged) and must not read as healthy — that is
+    exactly the pair `status` shows as ``service: running`` beside a FAIL line.
     """
-    try:
-        info = json.loads(HA_LOCK_FILE.read_text(encoding="utf-8") or "{}")
-        pid = int(info.get("pid") or 0)
-    except FileNotFoundError:
-        # Not "nothing is running": the lock can be gone while hass keeps
-        # running — deleted by hand, by a cleanup tool, or by a `git clean` in
-        # the wrong directory.  Measured: with both records removed and hass
-        # alive, the old early return printed "hass not running" and left the
-        # process running, so `start` would then report a start that was really
-        # the old instance answering on 8123.
-        return _scan_hass_process()
-    except (OSError, ValueError, TypeError, AttributeError):
-        return _scan_hass_process()
-    if pid > 0 and pid_exists(pid) and _pid_is_hass(pid):
-        return pid
-    # The lock file outlives every instance (runner.py never unlinks it), so a
-    # dead or recycled pid says nothing about what is running *now* — least of
-    # all on Windows, where fcntl is None and HA's own single-instance lock is
-    # inert, so two instances can genuinely coexist behind a single lock file.
-    return _scan_hass_process()
+    kind = _service_kind()
+    if kind == "systemd-user":
+        alive = _service_active()
+    elif kind == "launchd":
+        alive = _launchd_active()
+    elif kind == "service":
+        alive = _win_service_state() == "running"
+    else:
+        return False
+    return alive and port_in_use(PORT)
 
 
 def port_in_use(port: int) -> bool:
@@ -488,6 +457,54 @@ def _hass_serving(timeout: float = 1.5) -> bool:
         return False    # refused, reset, or still sitting unaccepted
 
 
+def _ipv4_ready() -> bool:
+    """True once the kernel has a non-loopback IPv4 route to offer.
+
+    A UDP ``connect`` sends no packet — it only asks the routing table, which is
+    the same moment DHCP hands the interface its address.  Microseconds per
+    call, so polling it costs nothing; that matters because this is asked on
+    every start, in the normal case exactly once.
+    """
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        sock.connect(("1.1.1.1", 53))
+        return sock.getsockname()[0] != "127.0.0.1"
+    except OSError:
+        return False
+    finally:
+        sock.close()
+
+
+def _wait_for_ipv4() -> float:
+    """Wait up to ``NET_WAIT_SEC`` for that address; returns seconds waited.
+
+    Silent when the address is already there, which is every start except the
+    one a supervisor performs at boot.  When the budget runs out it says so and
+    carries on: hass runs fine without an address, it just cannot announce
+    itself, and refusing to start would be a much worse answer than a missing
+    mDNS record.
+    """
+    started = time.monotonic()
+    ticked = False
+    while not _ipv4_ready():
+        waited = time.monotonic() - started
+        if waited >= NET_WAIT_SEC:
+            if ticked:
+                print(flush=True)
+            log("WARN  network: no address after "
+                f"{NET_WAIT_SEC}s — starting anyway, mDNS will not announce")
+            return waited
+        if not ticked:
+            log_partial("waiting for a network address ")
+            ticked = True
+        log_tick()
+        time.sleep(1.0)
+    if ticked:
+        print(flush=True)
+        log(f"network: address available after {time.monotonic() - started:.1f}s")
+    return time.monotonic() - started
+
+
 def _uv_bin() -> Path | None:
     """The uv the installer would use — project-local .tools first, then PATH.
 
@@ -524,7 +541,8 @@ def _deps_why() -> str:
     try:
         r = subprocess.run([str(uv), "sync", "--check", "--inexact"],
                            cwd=str(PROJECT_ROOT), capture_output=True,
-                           text=True, timeout=60)
+                           text=True, timeout=60,
+                           creationflags=_no_console_flags())
     except (OSError, subprocess.SubprocessError) as e:
         log(f"deps: uv check could not run ({e}) — continuing unverified")
         return ""
@@ -650,6 +668,1630 @@ def has_desktop() -> bool:
     if IS_WIN or sys.platform == "darwin":
         return True
     return bool(os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"))
+
+
+# ── service manager ───────────────────────────────────────────────────────────
+#
+# HomeAnt does not supervise itself.  Boot start-up and crash restart belong to
+# whatever supervisor the host already runs — systemd, launchd, the Windows SCM,
+# docker/k8s — and every one of them is handed the same contract: a foreground
+# process that exits when hass exits.  This section only *describes* that
+# relationship: which supervisor exists, and what its unit file says.  Writing
+# it, enabling it and waiting for HTTP are the caller's job.
+
+SERVICE_NAME = "homeant"
+# One name for "the file that makes this host start the home": a systemd unit
+# on Linux, a launchd plist on macOS.  Both live in the *user* domain and both
+# survive `stop`, so every caller that only asks "is it registered?" or "delete
+# the registration" stays platform-agnostic.  The plist keeps a `.service`
+# infix in its filename while the label stays `cn.homeant`: launchd indexes jobs
+# by Label, not by filename, and the longer name puts it next to the unit in
+# anyone's eye.
+LAUNCHD_LABEL = "cn.homeant"
+UNIT_PATH = (Path.home() / "Library" / "LaunchAgents" / f"{LAUNCHD_LABEL}.service.plist"
+             if sys.platform == "darwin"
+             else Path.home() / ".config" / "systemd" / "user" / f"{SERVICE_NAME}.service")
+
+# Stop budget, same number as HASS_STOP_WAIT_SEC in install.sh / install.ps1:
+# HA needs the window to flush .storage, and stopping earlier loses the owner
+# account that start just provisioned.
+STOP_WAIT_SEC = 20
+
+# How long start-up waits for an IPv4 address before going ahead anyway.
+# hass will not set up zeroconf without one: it logs "the system does not have
+# any enabled IPv4 addresses" and then fails with [Errno 19] No such device, so
+# nothing announces HomeAnt.local until someone restarts the home by hand.
+# Measured on the Debian VM (2026-11-06): the user unit starts ~2s after boot
+# with the interface still addressless, and `After=network-online.target` is no
+# help there — that target only exists in the *system* manager, and on that
+# machine it had never been reached at all (`ActiveEnterTimestamp` empty, the
+# address comes from `networking.service`/ifupdown, which orders before
+# `network.target`).
+# Bounded because a home that is not on a LAN must still come up: what is lost
+# without an address is the announcement, not the home itself.
+NET_WAIT_SEC = 20
+
+# `ERROR_SERVICE_SPECIFIC_ERROR`: what a service reports as dwWin32ExitCode
+# when it wants the SCM to record "this failed, with code N" instead of
+# "stopped cleanly".  The two are the difference between the failure actions
+# firing and being skipped, so it matters more than the number suggests —
+# pywin32 does not export the constant, hence the literal.
+WIN_ERROR_SERVICE_SPECIFIC = 1066
+
+
+def _no_console_flags() -> int:
+    """Spawn flags that stop a console child from opening a window of its own.
+
+    A console-less parent — the service host in Session 0, or anything spawned
+    by it — makes Windows allocate a *new* console for each console child.  The
+    window is invisible in Session 0 but the console still costs a window
+    station slot, and the same code path under a shell that has no console
+    flashes a black box on the user's desktop.  Asking for CREATE_NO_WINDOW
+    suppresses both.
+
+    Deliberately conditional: when a console already exists it must be
+    inherited, because hass writes its log to stdout and a child with no
+    console handle would drop every line.  POSIX has no such flag, so 0 there.
+    """
+    if not IS_WIN:
+        return 0
+    try:
+        import ctypes
+
+        if ctypes.windll.kernel32.GetConsoleWindow():
+            return 0
+    except Exception:  # pragma: no cover - console APIs are always present
+        return 0
+    return subprocess.CREATE_NO_WINDOW
+
+
+def _user_bus_env() -> dict | None:
+    """Environment for ``systemctl --user``, or None when there is no user bus.
+
+    Non-login shells (ssh, cron, ``sh -c``) do not carry ``XDG_RUNTIME_DIR`` and
+    ``systemctl --user`` then dies with "Failed to connect to bus".  The path is
+    derivable, so derive it: this is the one error direction that would silently
+    demote a working systemd host to "no service manager".  Shared by the probe
+    and by every acting call, because the two must never disagree about whether
+    a bus exists.
+    """
+    env = dict(os.environ)
+    if not env.get("XDG_RUNTIME_DIR"):
+        runtime = Path(f"/run/user/{os.getuid()}")
+        if not runtime.is_dir():
+            return None
+        env["XDG_RUNTIME_DIR"] = str(runtime)
+    return env
+
+
+def _service_kind() -> str:
+    """Which supervisor this host has: ``systemd-user``/``launchd``/``service``/``none``.
+
+    Read-only: probes, writes nothing, spawns nothing long-lived.  ``none`` is a
+    legitimate answer — containers, bare hosts, WSL2 without systemd enabled —
+    and the caller's job then is to ask for ``--foreground`` rather than to
+    invent a daemon of its own.
+    """
+    if IS_WIN:
+        return "service"
+    if sys.platform == "darwin":
+        return "launchd"
+    if not Path("/run/systemd/system").is_dir():
+        # Only exists while systemd is PID 1, which is also the cheapest honest
+        # test for it; containers therefore answer "none" without a special case.
+        return "none"
+    env = _user_bus_env()
+    if env is None:
+        return "none"
+    try:
+        r = subprocess.run(["systemctl", "--user", "show-environment"],
+                           capture_output=True, env=env, timeout=10)
+    except (OSError, subprocess.SubprocessError):
+        return "none"
+    return "systemd-user" if r.returncode == 0 else "none"
+
+
+def _service_registered() -> bool:
+    """Is a registration already standing for this host?
+
+    One predicate for the three places that must agree: `start`'s hand-over
+    migration (a hass running outside the supervisor), `stop`'s choice between
+    its verbs, and `status`'s "not installed" line.
+    """
+    if IS_WIN:
+        return _win_service_installed()
+    return UNIT_PATH.is_file()
+
+
+def _autostart_state() -> bool | None:
+    """Will this host start the home by itself after a reboot?
+
+    ``True`` / ``False`` / ``None``, and the last value is load-bearing: it means
+    "could not ask", which is not the same answer as "off".  Only an
+    unambiguous off earns the ``(autostart off)`` suffix in ``status`` —
+    guessing there would report a setting the user never chose.
+
+    Every probe is read-only and needs no rights: ``systemctl is-enabled`` owns
+    a *user* unit, the registry's ``Start`` value is world-readable, and
+    ``launchctl print-disabled`` reads the caller's own GUI domain.
+    """
+    kind = _service_kind()
+    if kind == "systemd-user":
+        r = _systemctl("is-enabled", SERVICE_NAME)
+        if r is None:
+            return None
+        word = (r.stdout or "").strip()
+        if word in ("enabled", "enabled-runtime"):
+            return True
+        if word == "disabled":
+            return False
+        return None             # static / indirect / mask / anything else
+    if kind == "service":
+        value = _win_reg_value("Start")
+        if value == "2":        # SERVICE_AUTO_START
+            return True
+        if value == "3":        # SERVICE_DEMAND_START — what `disable` writes
+            return False
+        return None             # 4=disabled, 0/1=boot drivers, or unreadable
+    if kind == "launchd":
+        r = _launchctl("print-disabled", _launchd_domain())
+        if r is None or r.returncode != 0:
+            return None
+        for line in (r.stdout or "").splitlines():
+            label, sep, value = line.partition("=>")
+            if not sep or label.strip().strip('"') != LAUNCHD_LABEL:
+                continue
+            value = value.strip().strip('";')
+            if value == "disabled":
+                return False
+            if value == "enabled":
+                return True
+            return None
+        # No record at all: launchd was never told either way, and the plist we
+        # write carries RunAtLoad=true, so it will start.
+        return True
+    return None
+
+
+def _render_unit() -> tuple[str, Path]:
+    """Return ``(unit file text, where it belongs)``.  Pure — nothing is written.
+
+    The unit anchors on *this source tree*, not on a launcher copied into
+    HA_ROOT: a copy is one more thing to keep in sync, and it would hide the
+    real path from ``systemctl cat homeant``, which is where anyone debugging a
+    failed start looks first.  The corollary is that moving the tree changes
+    this text, so the installer compares before rewriting.
+
+    ``ExecStart`` calls the venv interpreter directly: the release zip does not
+    preserve the executable bit on ``homeant``, and the installer must not have
+    to depend on it.  ``Restart=on-failure`` rather than ``always`` so the tree
+    is not resurrected during an upgrade, when it is being replaced underneath.
+    """
+    py = PROJECT_ROOT / ".venv" / "bin" / "python"
+    script = PROJECT_ROOT / "scripts" / "homeant.py"
+    text = f"""[Unit]
+Description=HomeAnt
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=120
+StartLimitBurst=5
+
+[Service]
+Type=simple
+ExecStart="{py}" "{script}" start --foreground
+WorkingDirectory={PROJECT_ROOT}
+Restart=on-failure
+RestartSec=10
+TimeoutStopSec={STOP_WAIT_SEC}
+KillMode=mixed
+
+[Install]
+WantedBy=default.target
+"""
+    return text, UNIT_PATH
+
+
+def _render_plist() -> tuple[str, Path]:
+    """Return ``(plist text, where it belongs)`` — the macOS twin of _render_unit.
+
+    Same contract, different spelling: ``ProgramArguments`` runs exactly the
+    command ``ExecStart`` runs, so ``--foreground`` is proven portable by the
+    two files agreeing instead of by an extra code path.  Only three keys are
+    not a translation of the unit: ``RunAtLoad`` (bootstrap alone would leave
+    the job idle), ``KeepAlive{SuccessfulExit=false}`` — the launchd way of
+    saying ``Restart=on-failure``, i.e. restart a crash but never a deliberate
+    stop — and ``ThrottleInterval=10``, the same ten seconds as ``RestartSec``.
+
+    ``StandardOutPath`` / ``StandardErrorPath`` go to ``/dev/null`` on purpose:
+    a LaunchAgent has no console and no ``journalctl``, but a log in
+    ~/Library/Logs would be the only file this project owns outside HA_ROOT —
+    exactly the residue uninstall would then have to chase.  Nothing is written
+    anywhere; HA's own log lives in HA_ROOT and is what `homeant logs` streams.
+    """
+    from xml.sax.saxutils import escape           # paths may contain & or <
+    py = PROJECT_ROOT / ".venv" / "bin" / "python"
+    script = PROJECT_ROOT / "scripts" / "homeant.py"
+    text = f"""<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>{LAUNCHD_LABEL}</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>{escape(str(py))}</string>
+        <string>{escape(str(script))}</string>
+        <string>start</string>
+        <string>--foreground</string>
+    </array>
+    <key>WorkingDirectory</key>
+    <string>{escape(str(PROJECT_ROOT))}</string>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <dict>
+        <key>SuccessfulExit</key>
+        <false/>
+    </dict>
+    <key>ThrottleInterval</key>
+    <integer>10</integer>
+    <key>StandardOutPath</key>
+    <string>/dev/null</string>
+    <key>StandardErrorPath</key>
+    <string>/dev/null</string>
+</dict>
+</plist>
+"""
+    return text, UNIT_PATH
+
+
+# How long to wait for the *service* to answer HTTP.  Matches the spawn path's
+# 300 ticks: a cold boot on /mnt/d (9p) was measured at 86s, so a 30s ceiling
+# would report a healthy first boot as dead.
+SERVICE_START_TIMEOUT = 300
+
+
+def _systemctl(*args: str) -> subprocess.CompletedProcess | None:
+    """Run ``systemctl --user <args>``; None when it cannot run at all.
+
+    ``capture_output`` throughout: enable/daemon-reload are chatty on stderr and
+    the caller decides what part of that is worth showing.
+    """
+    env = _user_bus_env()
+    if env is None:
+        return None
+    try:
+        return subprocess.run(["systemctl", "--user", *args], capture_output=True,
+                              text=True, env=env, timeout=120)
+    except (OSError, subprocess.SubprocessError):
+        return None
+
+
+def _service_active() -> bool:
+    r = _systemctl("is-active", SERVICE_NAME)
+    return bool(r and r.returncode == 0 and r.stdout.strip() == "active")
+
+
+def _service_main_pid() -> int:
+    r = _systemctl("show", SERVICE_NAME, "-p", "MainPID", "--value")
+    try:
+        return int((r.stdout or "").strip()) if r is not None else 0
+    except ValueError:
+        return 0
+
+
+def _parent_pid(pid: int) -> int:
+    """Parent of ``pid`` via /proc — or ``ps`` on macOS, which has no /proc.
+
+    ``systemctl show -p MainPID`` names the wrapper (``start --foreground``),
+    never hass, so the only cheap proof that the service owns the running hass
+    is the parent link — and this is where that link is read.  launchd reports a
+    real pid rather than a MainPID, but the pid it reports is the wrapper too,
+    so the same comparison applies on both platforms.
+    """
+    try:
+        stat = Path(f"/proc/{pid}/stat").read_text()
+    except OSError:
+        if sys.platform != "darwin":
+            return 0
+        try:
+            r = subprocess.run(["ps", "-o", "ppid=", "-p", str(pid)],
+                               capture_output=True, text=True, timeout=10)
+            return int((r.stdout or "").strip() or 0)
+        except (OSError, subprocess.SubprocessError, ValueError):
+            return 0
+    # comm may contain spaces and parentheses, so split after the last ')';
+    # what follows starts at state, making fields[1] the ppid.
+    rest = stat.rsplit(")", 1)
+    if len(rest) != 2:
+        return 0
+    fields = rest[1].split()
+    try:
+        return int(fields[1]) if len(fields) > 1 else 0
+    except ValueError:
+        return 0
+
+
+def _unit_tree(text: str) -> str | None:
+    """The source tree a rendered unit points at — for the repoint message."""
+    m = re.search(r'^ExecStart="[^"]+" "([^"]+)"', text, re.M)
+    return str(Path(m.group(1)).parent.parent) if m else None
+
+
+def _service_enable() -> bool:
+    """Enable at boot.  Idempotent, so ask first and only act when it is not."""
+    r = _systemctl("is-enabled", SERVICE_NAME)
+    if r is not None and r.returncode == 0 and r.stdout.strip() == "enabled":
+        return True
+    r = _systemctl("enable", SERVICE_NAME)
+    if r is None or r.returncode != 0:
+        detail = (r.stderr.strip() if r is not None and r.stderr else "systemctl --user enable failed")
+        log_red(f"service: cannot enable — {detail}")
+        return False
+    return True
+
+
+def _service_disable() -> bool:
+    """Turn off start-at-boot.  Idempotent: ask first, act only when it is on.
+
+    The state word is read from stdout, not from the exit code: measured on
+    Debian 13, ``systemctl --user is-enabled`` exits 1 for a disabled unit while
+    still printing ``disabled``.  So a second call touches nothing and says
+    nothing, which is what a scripted caller needs.
+
+    Only autostart changes.  The process keeps running and its crash-restart
+    policy is untouched — that policy belongs to the registration, not to this
+    verb.  Ending the process is `stop`'s job.
+    """
+    r = _systemctl("is-enabled", SERVICE_NAME)
+    if r is not None and (r.stdout or "").strip() == "disabled":
+        return True
+    r = _systemctl("disable", SERVICE_NAME)
+    if r is None or r.returncode != 0:
+        detail = (r.stderr.strip() if r is not None and r.stderr
+                  else "systemctl --user disable failed")
+        log_red(f"service: cannot disable — {detail}")
+        return False
+    return True
+
+
+def _install_unit() -> bool:
+    """Make the unit on disk match this tree.
+
+    Rewriting is content-compared, not unconditional: the unit is anchored on the
+    source tree, so an in-place upgrade leaves it byte-identical and
+    ``daemon-reload`` is skipped with it.  Moving the tree changes the text, and
+    that is the only case that prints the repoint line — otherwise "which tree
+    is the service really running" would only be answerable from
+    ``systemctl cat``.
+    """
+    text, path = _render_unit()
+    try:
+        current: str | None = path.read_text(encoding="utf-8")
+    except OSError:
+        current = None
+
+    if current == text:
+        return _service_enable()
+
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text, encoding="utf-8")
+    except OSError as e:
+        log_red(f"service: cannot write {path} — {e}")
+        return False
+
+    if current is None:
+        log(f"service installed: {path}")
+    else:
+        old, new = _unit_tree(current), str(PROJECT_ROOT)
+        if old and old != new:
+            log(f"service repointed: {old} -> {new}")
+        else:
+            log(f"service: unit updated ({path})")
+
+    r = _systemctl("daemon-reload")
+    if r is None or r.returncode != 0:
+        # Without the reload systemd keeps running the old text, so this is a
+        # failure rather than a warning: the next start would silently use the
+        # previous tree.
+        log_red("service: systemctl --user daemon-reload failed — "
+                "the unit on disk is newer than what systemd loaded")
+        return False
+    return _service_enable()
+
+
+def _service_reap() -> None:
+    """Stop a failed unit and show why it failed.
+
+    Without this, ``Restart=on-failure`` retries every 10s forever and the only
+    evidence sits in the journal: a boot that never happens, with no output on
+    the terminal that started it.
+    """
+    _systemctl("stop", SERVICE_NAME)
+    env = _user_bus_env()
+    if env is None:
+        return
+    try:
+        r = subprocess.run(["journalctl", "--user", "-u", SERVICE_NAME, "-n", "20", "--no-pager"],
+                           capture_output=True, text=True, env=env, timeout=30)
+    except (OSError, subprocess.SubprocessError):
+        return
+    log(f"last 20 journal lines (journalctl --user -u {SERVICE_NAME}):")
+    print((r.stdout or "").strip() or "(empty)", flush=True)
+
+
+# ── macOS: launchd ───────────────────────────────────────────────────────────
+#
+# A LaunchAgent in ``~/Library/LaunchAgents`` is the same deal as a systemd
+# *user* unit: no root, no password, and it dies with the user session.  Three
+# things differ from the Linux path and none of them is cosmetic.
+#
+# 1. ``load``/``unload`` are deprecated; the verbs are ``bootstrap <domain>
+#    <path>`` and ``bootout <domain>/<label>``.  There is no ``enable``: a plist
+#    that is present is picked up at the next login, which is also the price of
+#    the user domain — after a reboot the home starts **when someone logs in to
+#    the GUI**, not when the kernel comes up.  That is a property of launchd, and
+#    the README says so instead of pretending otherwise.
+# 2. ``bootout`` waits for the process to exit, and the process is the same
+#    ``start --foreground`` wrapper, so the SIGTERM forwarding that gives hass
+#    its 20-second flush window is what makes the stop survivable here too.
+# 3. There is no journal.  The wrapper's output goes to /dev/null; writing it
+#    to ~/Library/Logs would leave the only file we own outside HA_ROOT.  HA's
+#    own log inside HA_ROOT is the diagnostic source, via `homeant logs`.
+
+def _launchctl(*args: str) -> subprocess.CompletedProcess | None:
+    """Run ``launchctl <args>``; None when the binary cannot run at all."""
+    try:
+        return subprocess.run(["launchctl", *args], capture_output=True,
+                              text=True, timeout=STOP_WAIT_SEC + 20)
+    except (OSError, subprocess.SubprocessError):
+        return None
+
+
+def _launchd_domain() -> str:
+    """``gui/<uid>`` — the only domain a LaunchAgent can be bootstrapped into."""
+    return f"gui/{os.getuid()}"
+
+
+def _launchd_target() -> str:
+    return f"{_launchd_domain()}/{LAUNCHD_LABEL}"
+
+
+def _launchd_info() -> tuple[str, int]:
+    """``(state, pid)`` for the job; ``("", 0)`` when it is not loaded.
+
+    One ``launchctl print`` answers both questions, and it is also the only way
+    to tell "registered but stopped" from "never registered": a label that was
+    never bootstrapped exits 113 ("Could not find service") rather than
+    returning an empty state.  Only single-tab keys are read — the same words
+    appear again inside the job's nested sub-dictionaries, where they describe
+    something else.
+    """
+    r = _launchctl("print", _launchd_target())
+    if r is None or r.returncode != 0:
+        return "", 0
+    state, pid = "", 0
+    for line in (r.stdout or "").splitlines():
+        if not line.startswith("\t") or line.startswith("\t\t"):
+            continue
+        key, sep, value = line.strip().partition(" = ")
+        if not sep:
+            continue
+        if key == "state":
+            state = value.strip()
+        elif key == "pid":
+            try:
+                pid = int(value.strip())
+            except ValueError:
+                pid = 0
+    return state, pid
+
+
+def _launchd_active() -> bool:
+    return _launchd_info()[0] == "running"
+
+
+def _launchd_bootout() -> bool:
+    """Unload the job; True once it is gone.  Idempotent.
+
+    ``bootout`` against a label that was never loaded exits non-zero with
+    "Could not find service", and that is not a failure to stop anything — the
+    requested state already holds.  Any *other* non-zero exit is a failure:
+    reporting "stopped" while launchd keeps the home alive is the one outcome
+    this must never fake.
+    """
+    r = _launchctl("bootout", _launchd_target())
+    if r is not None and r.returncode != 0:
+        chatter = ((r.stderr or "") + (r.stdout or "")).strip()
+        if "Could not find service" not in chatter and "No such process" not in chatter:
+            why = chatter.splitlines()[-1] if chatter else f"launchctl exit {r.returncode}"
+            log_state("FAIL", f"cannot stop the service — {why}")
+            return False
+    # bootout blocks until the job exits, but a wrapper forwarding SIGTERM to
+    # hass is still inside its own 20-second window at that point: confirm the
+    # pid is gone before a caller deploys files under a live home.
+    deadline = time.monotonic() + STOP_WAIT_SEC + 10
+    while time.monotonic() < deadline:
+        state, _ = _launchd_info()
+        if not state:
+            return True
+        time.sleep(0.2)
+    log_state("FAIL", f"service: still {state} after {STOP_WAIT_SEC + 10}s")
+    return False
+
+
+def _launchd_set_enabled(on: bool) -> bool:
+    """Turn start-at-login on or off; True once launchd's ledger agrees.
+
+    Verified against ``print-disabled``, never against the exit code: ``enable``
+    and ``disable`` report nothing useful, and a disabled label then makes
+    ``bootstrap`` fail with a bare ``5: Input/output error`` — measured on
+    macOS 15 on 11-07, together with the two facts below.  That opaque failure
+    is exactly why this runs *before* the verb that needs it instead of being
+    diagnosed from it afterwards.
+
+    1. ``launchctl disable`` is this platform's ``mask``, stronger than
+       ``systemctl --user disable``: it gates *loading*, so ``bootstrap`` is
+       refused while the record says disabled, on the same uid, without root.
+    2. It gates loading only.  Measured the same day: a running job was disabled
+       and its process killed with SIGKILL; KeepAlive brought it back 15s later
+       (new pid, HTTP 200).  The crash-restart policy is untouched, which is
+       what this verb promises — it changes boot behaviour and nothing else.
+
+    Idempotent: the ledger is read first, so a second call issues no command.
+    ``_autostart_state()`` answers from that same ledger and treats "no record"
+    as on (the plist carries ``RunAtLoad=true``), so this converges from any of
+    the three states instead of assuming a record exists.
+    """
+    verb = "enable" if on else "disable"
+    if _autostart_state() == on:
+        return True
+    r = _launchctl(verb, _launchd_target())
+    if r is None:
+        log_state("FAIL", "service: launchctl could not run")
+        return False
+    if r.returncode != 0:
+        chatter = ((r.stderr or "") + (r.stdout or "")).strip()
+        why = chatter.splitlines()[-1] if chatter else f"launchctl exited {r.returncode}"
+        log_state("FAIL", f"cannot {verb} the service — {why}")
+        return False
+    if _autostart_state() != on:
+        log_state("FAIL", f"service: launchctl {verb} did not take — "
+                          f"launchctl print-disabled {_launchd_domain()}")
+        return False
+    return True
+
+
+def _plist_tree(text: str) -> str | None:
+    """The source tree an existing plist points at, for the repoint message."""
+    from xml.sax.saxutils import unescape
+    m = re.search(r"<key>WorkingDirectory</key>\s*<string>(.*?)</string>", text)
+    return unescape(m.group(1)) if m else None
+
+
+def _install_plist() -> bool:
+    """Make the plist on disk match this tree.  Content-compared, like the unit.
+
+    A plist is read when it is bootstrapped, not when it is written, so this
+    only puts bytes on disk; ``_service_up_launchd`` is what makes launchd look
+    at them again.
+    """
+    text, path = _render_plist()
+    try:
+        current: str | None = path.read_text(encoding="utf-8")
+    except OSError:
+        current = None
+    if current == text:
+        return True
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text, encoding="utf-8")
+    except OSError as e:
+        log_state("FAIL", f"service: cannot write {path} — {e}")
+        return False
+    if current is None:
+        log(f"service installed: {path}")
+    else:
+        old = _plist_tree(current)
+        if old and old != str(PROJECT_ROOT):
+            log(f"service repointed: {old} -> {PROJECT_ROOT}")
+        else:
+            log(f"service: plist updated ({path})")
+    return True
+
+
+def _service_up_launchd() -> int:
+    """Write, register and start the job; return its pid, or 0 on failure.
+
+    0 means the start did not happen and the caller must not fall back to
+    spawning — the same rule as ``_service_up``, for the same reason.
+
+    ``bootstrap`` refuses a label that is already loaded, and the plist bytes
+    may be newer than what launchd holds, so the sequence is always "bootout,
+    then bootstrap".  Nothing of ours is running when this is reached: ``start``
+    only calls it from its cold path.
+    """
+    if not _install_plist():
+        return 0
+    _launchd_bootout()
+    r = _launchctl("bootstrap", _launchd_domain(), str(UNIT_PATH))
+    if r is None:
+        log_state("FAIL", "service: launchctl could not run")
+        return 0
+    if r.returncode != 0:
+        chatter = ((r.stderr or "") + (r.stdout or "")).strip()
+        why = chatter.splitlines()[-1] if chatter else f"launchctl bootstrap exited {r.returncode}"
+        log_state("FAIL", f"service did not start — {why}")
+        return 0
+    for _ in range(100):
+        state, pid = _launchd_info()
+        if pid:
+            return pid
+        if not state:
+            break
+        time.sleep(0.1)
+    log_state("FAIL", "service started but launchd reports no pid")
+    return 0
+
+
+def _login_user() -> str:
+    """The account that owns the user manager, without trusting ``$USER``.
+
+    A non-login shell (ssh command, cron, systemd itself) can have no ``USER``,
+    and the wrong name here would query somebody else's linger flag.
+    """
+    try:
+        import pwd
+        return pwd.getpwuid(os.getuid()).pw_name
+    except (ImportError, KeyError, OSError):
+        return os.environ.get("USER") or os.environ.get("LOGNAME") or ""
+
+
+def _linger_state() -> str | None:
+    """Does this user's manager survive logout?  ``yes`` / ``no`` / ``None``.
+
+    ``None`` means "could not ask" — a container without logind, or a bus that
+    is not there.  It is deliberately distinct from ``no``: one is a setting to
+    fix, the other is a question that never got answered.
+    """
+    user = _login_user()
+    if not user:
+        return None
+    try:
+        r = subprocess.run(["loginctl", "show-user", user, "-p", "Linger"],
+                           capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if r.returncode != 0:
+        return None
+    out = (r.stdout or "").strip()
+    if not out.startswith("Linger="):
+        return None
+    return out.split("=", 1)[1].strip() or None
+
+
+def _linger_ensure() -> bool:
+    """Open linger before the start touches anything.  False = start must stop.
+
+    Without linger systemd starts the user manager only when somebody logs in,
+    so a reboot leaves the unit inactive until that login — which breaks the
+    one promise the service layer exists to keep.  That is why this runs as a
+    gate at the entry rather than as a note at the end: learning it after a
+    successful start would turn the promise into a postscript.
+
+    The bare form is the right one here: loginctl sends an empty user, logind
+    resolves it to the owner of the caller's session, and logind picks the
+    policy action by ``target == euid`` — asking for oneself gets
+    ``set-self-linger`` (``allow_any=yes``), never ``auth_admin_keep``.  A
+    policy file only counts on a host that runs polkit, though: without
+    polkitd logind cannot evaluate any action and answers EACCES even for
+    ``allow_any=yes`` (measured 11-05 on Debian 13 with no polkitd), so root is
+    the only way in.  That retry goes through ``sudo -n`` and only that form: a
+    plain sudo would sit on a password prompt no unattended start can answer,
+    while ``-n`` either succeeds on a NOPASSWD host or fails immediately.
+
+    The verdict is read back from ``Linger``, never from the wording of a
+    failure: without polkit logind answers ``Could not enable linger: No such
+    device or address`` (measured 11-10 on WSL 2 with Debian 13) — there is no
+    permission word anywhere in it — so a keyword test calls that failure a
+    success and the start ends up promising a boot it cannot deliver.
+    """
+    if _linger_state() == "yes":
+        return True                 # idempotent, and silent on the happy path
+
+    # Two bounded attempts, ordered by how little they cost the host: the bare
+    # form asks nobody for anything, and only when that fails do we spend one
+    # non-interactive sudo.  Each attempt's own last line is kept, so the report
+    # below quotes loginctl (or sudo) instead of guessing at a cause.
+    attempts = [("loginctl", ["loginctl", "enable-linger"])]
+    user = _login_user()
+    if user:
+        attempts.append(("sudo", ["sudo", "-n", "loginctl", "enable-linger", user]))
+
+    said = []
+    for label, cmd in attempts:
+        try:
+            r = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+        except (OSError, subprocess.SubprocessError) as e:
+            said.append((label, str(e)))
+            continue
+        if _linger_state() == "yes":
+            return True             # it worked; the wording never mattered
+        lines = ((r.stderr or "") + (r.stdout or "")).strip().splitlines()
+        if lines:
+            said.append((label, lines[-1]))
+
+    # Neither attempt moved it, so the start stops here instead of promising a
+    # boot it cannot deliver.  "$USER" keeps the hint copy-pastable: the shell
+    # expands it before sudo runs, so the name is the user's, not root's.
+    log_state("FAIL", "linger is off and could not be enabled without root")
+    for label, text in said:
+        # sudo's own message already starts with "sudo: ", so a plain label
+        # prefix would read "sudo: sudo: a password is required".
+        prefix = f"{label}: "
+        if text.startswith(prefix):
+            text = text[len(prefix):]
+        log(f"      {label}: {text}")
+    log('      run: sudo loginctl enable-linger "$USER" && ./homeant start')
+    return False
+
+
+def _service_up() -> int:
+    """Install, enable and start the unit; return hass's MainPID, or 0 on failure.
+
+    0 means the start did not happen — the caller must return rather than fall
+    back to spawning, because two start sources on one port is exactly what the
+    unit exists to prevent.
+    """
+    if not _install_unit():
+        return 0
+    # Clear the start limiter before an explicit start.  StartLimitBurst=5 in
+    # 120s is there to stop a *crash loop* from spinning, but it also outlives
+    # the cause: after five failed boots, systemd answers every attempt with
+    # "Start request repeated too quickly" until the window expires, so a user
+    # who just fixed the problem and re-ran `homeant start` would still be
+    # refused, with a message that names neither the unit nor the reason.
+    # Measured on Debian 13: the sixth attempt inside 120s fails instantly this
+    # way even though the interpreter was restored two lines earlier.
+    _systemctl("reset-failed", SERVICE_NAME)
+    r = _systemctl("start", SERVICE_NAME)
+    if r is None:
+        log_red("service: systemctl --user start could not run")
+        return 0
+    if r.returncode != 0:
+        detail = (r.stderr or r.stdout or "").strip()
+        log_state("FAIL", f"service did not start — {detail or 'systemctl --user start failed'}")
+        _service_reap()
+        return 0
+    # Type=simple forks before MainPID settles; a short poll avoids reporting
+    # "no MainPID" for the handful of milliseconds it is still 0.
+    for _ in range(50):
+        pid = _service_main_pid()
+        if pid:
+            return pid
+        if not _service_active():
+            break
+        time.sleep(0.1)
+    log_state("FAIL", "service started but systemd reports no MainPID")
+    _service_reap()
+    return 0
+
+
+# ── Windows: the service control manager ─────────────────────────────────────
+#
+# A Windows service is a registry entry, not a file, and the SCM is the only
+# supervisor this design accepts there — Task Scheduler is deliberately not a
+# fallback.  Two rules shape the code below.
+#
+# 1. ``sc.exe`` is never called.  Its text is localised (measured on a zh-CN
+#    host: the state comes back translated, not as the word RUNNING), so every
+#    query would need a locale table.  pywin32 already speaks SCM and the venv
+#    carries it — ``mcp`` depends on it and the dependency pins live in
+#    pyproject.toml — so the state is a number and nothing has to be parsed.
+# 2. pywin32 is imported *inside* these functions, never at module load: a
+#    Linux host must not care that it exists, and a host without it has to get
+#    one readable line instead of a traceback.
+
+WIN_SERVICE_KEY = rf"SYSTEM\CurrentControlSet\Services\{SERVICE_NAME}"
+SERVICE_DISPLAY_NAME = "HomeAnt"
+SERVICE_DESCRIPTION = "HomeAnt — Control home through Agent"
+# Where the supervised process's own output goes.  Session 0 has no console, so
+# ``sys.stdout`` is None there and the first print() would raise.
+SERVICE_LOG = HA_ROOT / "service.log"
+
+# SERVICE_STOPPED(1) … SERVICE_RUNNING(4) … -> two words.  Pending joins
+# "stopped" on purpose: a transition is not a start, and `status` has exactly
+# one line to spend on this.
+_WIN_STATES = {1: "stopped", 2: "stopped", 3: "stopped", 4: "running",
+               5: "stopped", 6: "stopped", 7: "stopped"}
+
+
+def _win_scm():
+    """``(win32service, win32serviceutil)``, or None when pywin32 is absent."""
+    try:
+        import win32service
+        import win32serviceutil
+    except ImportError:
+        return None
+    return win32service, win32serviceutil
+
+
+def _is_admin() -> bool:
+    """May this process write HKLM and create services?"""
+    try:
+        import ctypes
+        return bool(ctypes.windll.shell32.IsUserAnAdmin())
+    except (AttributeError, OSError):
+        return False
+
+
+def _win_service_installed() -> bool:
+    """Is the registration there?  Read from the registry: no pywin32, no rights.
+
+    ``sc query`` would answer the same question at the price of a subprocess
+    whose output has to be understood in whatever language Windows is set to.
+    """
+    try:
+        import winreg
+        with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, WIN_SERVICE_KEY):
+            return True
+    except (ImportError, OSError):
+        return False
+
+
+def _win_service_state() -> str:
+    """``running`` / ``stopped`` / ``not installed`` / ``unknown``."""
+    if not _win_service_installed():
+        return "not installed"
+    scm = _win_scm()
+    if scm is None:
+        return "unknown"
+    try:
+        status = scm[1].QueryServiceStatus(SERVICE_NAME)
+    except Exception:       # pywin32 raises its own type, which is not OSError
+        return "unknown"
+    return _WIN_STATES.get(status[1], "unknown")
+
+
+def _win_service_bin_path() -> str:
+    """The command line the SCM will run.
+
+    The venv interpreter plus the script path — the same anchor the systemd
+    unit uses, and never a copy: the project is one file whose name cannot be
+    imported (``homeant.py`` has no module form), so ``-m`` is out and an
+    absolute script path is the only shape that works.  ``--service-host`` is
+    what turns that process into something the SCM can talk to.
+    """
+    py = PROJECT_ROOT / ".venv" / "Scripts" / "python.exe"
+    script = PROJECT_ROOT / "scripts" / "homeant.py"
+    return f'"{py}" "{script}" start --service-host'
+
+
+def _win_reg_value(name: str) -> str | None:
+    """Read one value from the service key, or None."""
+    try:
+        import winreg
+        with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, WIN_SERVICE_KEY) as k:
+            if name == "Environment":
+                value, _ = winreg.QueryValueEx(k, name)
+                return "|".join(value) if isinstance(value, list) else str(value)
+            value, _ = winreg.QueryValueEx(k, name)
+            return str(value)
+    except (ImportError, OSError):
+        return None
+
+
+def _win_service_home_ok() -> bool:
+    """Does the service already run with *this* user's profile?
+
+    A service runs as LocalSystem, where ``Path.home()`` is
+    ``system32\\config\\systemprofile`` — so without this every HA_ROOT lookup
+    in the supervised process points at a directory nobody meant.  The SCM
+    injects this REG_MULTI_SZ into the service's environment at start-up, which
+    fixes it for the wrapper *and* for the hass it spawns, including HA's own
+    use of the user profile.
+    """
+    want = f"USERPROFILE={Path.home()}"
+    have = _win_reg_value("Environment") or ""
+    return want in have.split("|")
+
+
+def _win_service_home_write() -> bool:
+    """Write the profile value.  Administrator rights required."""
+    try:
+        import winreg
+        with winreg.CreateKeyEx(winreg.HKEY_LOCAL_MACHINE, WIN_SERVICE_KEY, 0,
+                                winreg.KEY_SET_VALUE) as k:
+            winreg.SetValueEx(k, "Environment", 0, winreg.REG_MULTI_SZ,
+                              [f"USERPROFILE={Path.home()}"])
+    except (ImportError, OSError) as e:
+        log_state("FAIL", f"cannot set the service environment — {e}")
+        return False
+    return True
+
+
+def _win_grant_control(win32service, hs) -> None:
+    """Add RP (start) and WP (stop) for interactive users to the service DACL.
+
+    ``sc create`` leaves ``IU`` with query/interrogate rights only, so every
+    ``homeant stop`` would need an elevated prompt — the one promise this design
+    cannot break.  Only this service's DACL is touched, and only the ``IU`` ace:
+    administrators keep their full rights, SYSTEM keeps everything, and nobody
+    gains the right to *reconfigure* the service (``DC``), which would let any
+    user repoint the binary at anything.
+    """
+    try:
+        import win32security
+        sd = win32service.QueryServiceObjectSecurity(
+            hs, win32security.DACL_SECURITY_INFORMATION)
+        sddl = win32security.ConvertSecurityDescriptorToStringSecurityDescriptor(
+            sd, win32security.SDDL_REVISION_1,
+            win32security.DACL_SECURITY_INFORMATION)
+    except Exception as e:
+        log(f"service: cannot read the service DACL — {e}")
+        return
+    m = re.search(r"\(A;;([A-Z]+);;;IU\)", sddl)
+    if m is None:
+        # A hardened image whose default DACL has no interactive-user ace.
+        # Not a failure — start/stop will simply ask for elevation, which is
+        # the behaviour this is improving on.
+        log("service: no interactive-user ACE to extend — start/stop will "
+            "need an elevated prompt")
+        return
+    rights = m.group(1)
+    pairs = {rights[i:i + 2] for i in range(0, len(rights) - 1, 2)}
+    if {"RP", "WP"} <= pairs:
+        return
+    try:
+        patched = sddl.replace(m.group(0), f"(A;;{rights}RPWP;;;IU)")
+        win32service.SetServiceObjectSecurity(
+            hs, win32security.DACL_SECURITY_INFORMATION,
+            win32security.ConvertStringSecurityDescriptorToSecurityDescriptor(
+                patched, win32security.SDDL_REVISION_1))
+    except Exception as e:
+        log(f"service: cannot grant start/stop to users — {e}")
+
+
+def _win_failure_flag_api():
+    """Query/set ``SERVICE_CONFIG_FAILURE_ACTIONS_FLAG`` through advapi32.
+
+    pywin32 cannot do this one level, and that is not a guess: the strings in
+    ``win32service.pyd`` are ``QueryServiceConfig2: Level %d is not supported``
+    and ``Unsupported information level``, and only
+    ``SERVICE_CONFIG_FAILURE_ACTIONS`` (2) has a known shape there.  The flag is
+    level 4.  Both calls therefore go to the Win32 API directly, which takes a
+    plain ``BOOL*`` for this level.
+
+    Returns ``(get, put, why)``: ``get(handle)`` is ``True``/``False``/``None``
+    (``None`` = the read failed, so the caller still tries to write),
+    ``put(handle)`` is the boolean result, and ``why()`` names the last Win32
+    error.  ``None`` when advapi32 is not reachable at all.
+    """
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        lib = ctypes.WinDLL("advapi32", use_last_error=True)
+        lib.QueryServiceConfig2W.argtypes = (
+            wintypes.HANDLE, wintypes.DWORD, ctypes.c_void_p,
+            ctypes.POINTER(wintypes.DWORD))
+        lib.QueryServiceConfig2W.restype = wintypes.BOOL
+        lib.ChangeServiceConfig2W.argtypes = (
+            wintypes.HANDLE, wintypes.DWORD, ctypes.c_void_p)
+        lib.ChangeServiceConfig2W.restype = wintypes.BOOL
+    except (AttributeError, OSError):
+        return None
+
+    level = 4  # SERVICE_CONFIG_FAILURE_ACTIONS_FLAG
+
+    def get(handle: int):
+        value = wintypes.BOOL()
+        needed = wintypes.DWORD(0)
+        if not lib.QueryServiceConfig2W(
+                handle, level, ctypes.byref(value), ctypes.byref(needed)):
+            return None
+        return bool(value.value)
+
+    def put(handle: int) -> bool:
+        value = wintypes.BOOL(True)
+        return bool(lib.ChangeServiceConfig2W(handle, level, ctypes.byref(value)))
+
+    def why() -> str:
+        return str(ctypes.WinError(ctypes.get_last_error()))
+
+    return get, put, why
+
+
+def _win_put_crash_flag(handle: int) -> bool | None:
+    """Set the flag on one open service handle.
+
+    ``True`` = written, ``None`` = it was already on (nothing written),
+    ``False`` = refused, and the reason has been logged.  Split out because two
+    callers need it: the repair path (which opens the service itself) and
+    registration (which already holds a handle it created).
+    """
+    api = _win_failure_flag_api()
+    if api is None:
+        return False
+    get, put, why = api
+    try:
+        if get(handle):
+            return None
+        if not put(handle):
+            log(f"service: cannot enable restart-on-crash — {why()}")
+            return False
+    except Exception as e:
+        log(f"service: cannot enable restart-on-crash — {e}")
+        return False
+    return True
+
+
+def _win_ensure_crash_recovery() -> None:
+    """Flag a plain non-zero exit as a failure too, when it is still unset.
+
+    Registration writes this, so every service installed from now on has it.
+    A service registered by an earlier build has the failure *actions* and not
+    the flag, and the SCM then restarts it only when the process crashes.  hass
+    dying is not a crash: the host sees its child's exit status and returns that
+    code, which is an ordinary exit — so the home would stay down until someone
+    noticed.  Linux gets this for free from ``Restart=on-failure``.
+
+    Best effort on purpose: a start that is otherwise fine must not fail over a
+    setting that only matters after a crash — but a *silent* except is what hid
+    this being broken for three attempts, so a failure now says so in one line
+    and still returns normally.      Nothing is written when the flag is already
+    right, and the caller skips all of it when we are not elevated.  A service
+    that is not registered yet is skipped too: registration writes the flag
+    itself, and calling OpenService before that prints a spurious 1060 line on
+    the first `start` after an uninstall.
+    """
+    if not _win_service_installed():
+        return
+    import win32service
+
+    try:
+        hscm, hs = _win_open_service(
+            win32service, win32service.SERVICE_CHANGE_CONFIG)
+    except Exception as e:
+        log(f"service: cannot open the service to enable restart-on-crash — {e}")
+        return
+    try:
+        if _win_put_crash_flag(int(hs)):
+            log("service: restart-on-crash enabled")
+    except Exception as e:
+        log(f"service: cannot enable restart-on-crash — {e}")
+    finally:
+        for h in (hs, hscm):
+            try:
+                win32service.CloseServiceHandle(h)
+            except Exception:
+                pass
+
+
+def _win_service_ensure() -> bool:
+    """Create the registration, or repoint it, and nothing when it is right.
+
+    Called on every ``start``, but most of this needs administrator rights, so
+    the first question is whether anything needs doing: an in-place upgrade
+    leaves ``ImagePath`` byte-identical and this returns without writing HKLM.
+    A moved tree rewrites the path and says so — the same line the systemd side
+    prints, and the only honest way to answer "which tree is the service really
+    running".
+    """
+    scm = _win_scm()
+    if scm is None:
+        log_state("FAIL", "pywin32 is required for service mode — "
+                          "uv sync installs it (mcp depends on it)")
+        return False
+    win32service = scm[0]
+    bin_path = _win_service_bin_path()
+    installed = _win_service_installed()
+
+    if installed and _win_reg_value("ImagePath") == bin_path and _win_service_home_ok():
+        # The hot path is what a non-elevated `start` takes, and it stays free
+        # of SCM calls on purpose: every one of them needs a right the prompt
+        # denies.  The one setting an upgrade cannot reach is repaired by
+        # _win_ensure_crash_recovery, which cmd_start calls at the entry gate
+        # where it also covers the "already running" path.
+        return True
+
+    try:
+        hscm = win32service.OpenSCManager(
+            None, None, win32service.SC_MANAGER_CREATE_SERVICE)
+    except Exception as e:
+        log_state("FAIL", f"cannot open the service manager — {e}")
+        if not _is_admin():
+            log("      registering a service needs administrator rights — "
+                "re-run from an elevated prompt")
+        return False
+
+    try:
+        try:
+            if installed:
+                hs = win32service.OpenService(
+                    hscm, SERVICE_NAME, win32service.SERVICE_ALL_ACCESS)
+            else:
+                hs = win32service.CreateService(
+                    hscm, SERVICE_NAME, SERVICE_DISPLAY_NAME,
+                    win32service.SERVICE_ALL_ACCESS,
+                    win32service.SERVICE_WIN32_OWN_PROCESS,
+                    win32service.SERVICE_AUTO_START,
+                    win32service.SERVICE_ERROR_NORMAL,
+                    bin_path, None, 0, None, None, None)
+        except Exception as e:
+            log_state("FAIL", f"cannot {'open' if installed else 'create'} "
+                              f"the service — {e}")
+            return False
+
+        try:
+            if installed:
+                old = _win_reg_value("ImagePath") or "(none)"
+                if old != bin_path:
+                    win32service.ChangeServiceConfig(
+                        hs, win32service.SERVICE_NO_CHANGE,
+                        win32service.SERVICE_NO_CHANGE,
+                        win32service.SERVICE_NO_CHANGE, bin_path,
+                        None, 0, None, None, None, None)
+                    log(f"service repointed: {old} -> {bin_path}")
+            win32service.ChangeServiceConfig2(
+                hs, win32service.SERVICE_CONFIG_DESCRIPTION, SERVICE_DESCRIPTION)
+            # Crash restart, matching Restart=on-failure + RestartSec=10 on
+            # Linux.  Three attempts and stop trying: a home that cannot boot is
+            # not fixed by a fourth, and an endless retry hides the reason.
+            win32service.ChangeServiceConfig2(
+                hs, win32service.SERVICE_CONFIG_FAILURE_ACTIONS,
+                {"ResetPeriod": 86400, "RebootMsg": "", "Command": "",
+                 "Actions": [(win32service.SC_ACTION_RESTART, 10_000)] * 3})
+            # Without this flag the actions above fire only when the *process*
+            # dies abnormally (TerminateProcess, unhandled exception).  hass
+            # dying is not that: the host sees its child exit and returns that
+            # code, i.e. an ordinary exit with a non-zero status — which the SCM
+            # then treats as a plain stop and does not restart.  Set, so a
+            # crashed hass is restarted exactly like Restart=on-failure does it
+            # on Linux.  A user-requested stop stays quiet because SvcStop
+            # returns 0.
+            #
+            # Not through win32service: level 4 is unimplemented there (it
+            # answers "Unsupported information level", which failed the whole
+            # registration when this line was a ChangeServiceConfig2 call).
+            # _win_put_crash_flag goes to advapi32 and never raises.
+            _win_put_crash_flag(int(hs))
+            _win_grant_control(win32service, hs)
+        except Exception as e:
+            log_state("FAIL", f"cannot configure the service — {e}")
+            return False
+        finally:
+            win32service.CloseServiceHandle(hs)
+    finally:
+        win32service.CloseServiceHandle(hscm)
+
+    if not _win_service_home_ok() and not _win_service_home_write():
+        return False
+    if not installed:
+        log(f"service installed: {SERVICE_NAME}")
+    return True
+
+
+def _win_open_service(win32service, access: int):
+    """Open the SCM and *this* service with exactly the rights the caller needs.
+
+    pywin32's convenience wrappers — ``StartService``, ``StopService``,
+    ``RemoveService`` — hard-code ``SC_MANAGER_ALL_ACCESS`` and
+    ``SERVICE_ALL_ACCESS``.  Measured on this machine: the service DACL really
+    does carry ``RP``/``WP`` for interactive users (see
+    ``(A;;CCLCSWRPWPLOCRRC;;;IU)``), yet those wrappers still fail with "Access
+    is denied", because opening the *manager* with ``ALL_ACCESS`` is itself
+    privileged — ``IU`` holds ``CC LC SW LO CR RC`` and nothing near ``GA``.
+    So the manager is opened with ``SC_MANAGER_CONNECT`` (which ``IU`` has by
+    default) and the service with the one mask the operation needs.
+
+    Returns ``(hscm, hs)``; the caller closes both.
+    """
+    hscm = win32service.OpenSCManager(None, None, win32service.SC_MANAGER_CONNECT)
+    try:
+        hs = win32service.OpenService(hscm, SERVICE_NAME, access)
+    except Exception:
+        win32service.CloseServiceHandle(hscm)
+        raise
+    return hscm, hs
+
+
+def _win_service_set_start(auto: bool) -> bool:
+    """Set start-at-boot, or explain why this prompt cannot.
+
+    The hot path is a registry read: ``Start`` is world-readable, so a host that
+    is already in the requested state needs no rights at all and no SCM call.
+    Changing it is the privileged half — ``ChangeServiceConfig`` needs
+    ``SERVICE_CHANGE_CONFIG``, and measured on this machine a plain user gets
+    ``(5, 'OpenService', '拒绝访问')`` for that mask.  The right cannot be
+    granted to ``IU`` either: it also allows rewriting ``ImagePath``, i.e.
+    pointing a LocalSystem service at any binary.
+
+    Refusing up front instead of warning afterwards is the contract every verb
+    in this file follows.  A `disable` that "mostly worked" would read as done
+    while the home still came back at the next boot.
+
+    ``DEMAND_START`` rather than ``DISABLED``: the service must stay startable
+    by hand, and only autostart is being turned off.
+    """
+    want = "2" if auto else "3"
+    if _win_reg_value("Start") == want:
+        return True                 # idempotent, no rights, no SCM call
+    verb = "enable" if auto else "disable"
+    if not _is_admin():
+        log_state("FAIL", f"cannot {verb} the service — needs administrator rights")
+        log("      re-run from an elevated prompt")
+        return False
+    scm = _win_scm()
+    if scm is None:
+        log_state("FAIL", "pywin32 is required for service mode — "
+                          "uv sync installs it (mcp depends on it)")
+        return False
+    win32service = scm[0]
+    try:
+        hscm, hs = _win_open_service(win32service,
+                                     win32service.SERVICE_CHANGE_CONFIG)
+    except Exception as e:
+        log_state("FAIL", f"cannot {verb} the service — {e}")
+        return False
+    try:
+        win32service.ChangeServiceConfig(
+            hs,
+            win32service.SERVICE_NO_CHANGE,
+            win32service.SERVICE_AUTO_START if auto else win32service.SERVICE_DEMAND_START,
+            win32service.SERVICE_NO_CHANGE,
+            None, None, 0, None, None, None, None)
+    except Exception as e:
+        log_state("FAIL", f"cannot {verb} the service — {e}")
+        return False
+    finally:
+        win32service.CloseServiceHandle(hs)
+        win32service.CloseServiceHandle(hscm)
+    return True
+
+
+def _win_service_start() -> bool:
+    """Ask the SCM to start it.  StartService blocks until it reports RUNNING."""
+    scm = _win_scm()
+    if scm is None:
+        return False
+    win32service = scm[0]
+    try:
+        hscm, hs = _win_open_service(
+            win32service,
+            win32service.SERVICE_START | win32service.SERVICE_QUERY_STATUS)
+        try:
+            # The second argument is mandatory in pywin32's binding even though
+            # it means "no command-line arguments": StartService(hs) raises
+            # "takes exactly 2 arguments (1 given)".  Measured on 11-05.
+            win32service.StartService(hs, None)
+        finally:
+            win32service.CloseServiceHandle(hs)
+            win32service.CloseServiceHandle(hscm)
+    except Exception as e:
+        log_state("FAIL", f"service did not start — {e}")
+        return False
+    return True
+
+
+def _win_reap() -> None:
+    """Show why the service died, the way journalctl does on Linux."""
+    try:
+        lines = SERVICE_LOG.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return
+    log(f"last 20 lines of {SERVICE_LOG}:")
+    print("\n".join(lines[-20:]).strip() or "(empty)", flush=True)
+
+
+def _win_service_stop() -> bool:
+    """Stop it and wait for the SCM to confirm.
+
+    The start type is deliberately *not* touched here.  Changing it needs
+    ``SERVICE_CHANGE_CONFIG``, which only an administrator may hold — granting
+    it to interactive users would let them repoint the binary — so a Windows
+    ``stop`` stops the process and leaves start-at-boot alone.  Linux has no
+    such split: `disable` there is unprivileged, which is why `cmd_stop` does
+    both verbs on that side and one here.
+    """
+    scm = _win_scm()
+    if scm is None:
+        return False
+    if _win_service_state() != "running":
+        return True
+    win32service = scm[0]
+    try:
+        # Same minimal mask as `start`: STOP alone would be enough for the
+        # control call, but QUERY_STATUS is what lets the wait below read a
+        # state the SCM will actually hand an interactive user.
+        hscm, hs = _win_open_service(
+            win32service,
+            win32service.SERVICE_STOP | win32service.SERVICE_QUERY_STATUS)
+        try:
+            win32service.ControlService(hs, win32service.SERVICE_CONTROL_STOP)
+        finally:
+            win32service.CloseServiceHandle(hs)
+            win32service.CloseServiceHandle(hscm)
+    except Exception as e:
+        log_state("FAIL", f"cannot stop the service — {e}")
+        return False
+    # The SCM reports STOPPED once our SvcStop's tree-kill has finished; wait
+    # for it instead of assuming, because the caller may delete the tree next.
+    for _ in range(STOP_WAIT_SEC * 2):
+        if _win_service_state() != "running":
+            return True
+        time.sleep(0.5)
+    log_state("FAIL", f"service still running after {STOP_WAIT_SEC}s")
+    return False
+
+
+def _service_stop_now() -> bool | None:
+    """Stop the supervisor's process without touching its start type.
+
+    ``None`` means nothing supervises this host, so the caller keeps its own way
+    of stopping.  Same single verb as ``cmd_stop`` — the difference is only who
+    asks: this runs *inside* ``start``, which is about to bring the home back,
+    and it also runs inside ``uninstall``, which clears the registration next.
+    Both branches wait for the manager to confirm, so a caller that deploys
+    files next never races a process still flushing stores.
+    """
+    kind = _service_kind()
+    if kind == "systemd-user" and UNIT_PATH.exists():
+        r = _systemctl("stop", SERVICE_NAME)
+        if r is None or r.returncode != 0:
+            chatter = ((r.stderr or "") + (r.stdout or "")).strip() if r else ""
+            why = (chatter.splitlines()[-1] if chatter
+                   else f"systemctl exited {r.returncode}" if r
+                   else "systemctl is unavailable")
+            log_state("FAIL", f"cannot stop the service — {why}")
+            return False
+        return True
+    if kind == "service" and _win_service_installed():
+        return _win_service_stop()
+    if kind == "launchd" and UNIT_PATH.exists():
+        # bootout unloads the job; it does not delete the plist, which is what
+        # makes this the "stop, keep the registration" verb `start` expects.
+        return _launchd_bootout()
+    return None
+
+
+def _stop_own_hass() -> bool:
+    """Stop the instance that owns HA_ROOT, by the one rule this host allows.
+
+    Under a supervisor the request goes to the supervisor, never to the pid:
+    killing its child behind its back is indistinguishable from a crash, and the
+    SCM/systemd then restarts the home about ten seconds later — right in the
+    middle of the redeploy that asked for the stop (measured on Windows: exit
+    code 1066 plus the failure actions).  With no supervisor there is nothing to
+    ask, so the pid is the only tool; when not even that is readable, report
+    failure rather than pretend the port will free itself.
+    """
+    by_service = _service_stop_now()
+    if by_service is not None:
+        return by_service
+    pid = _ha_instance()
+    if pid:
+        return _stop_pid(pid)
+    return not port_in_use(PORT)
+
+
+def _win_service_unregister() -> tuple[bool, str | None]:
+    """Stop it if it runs, then delete the registration."""
+    if not _win_service_installed():
+        return True, None
+    if not _win_service_stop():
+        return False, None
+    scm = _win_scm()
+    if scm is None:
+        log_state("FAIL", "pywin32 is required to remove the service")
+        return False, None
+    try:
+        scm[1].RemoveService(SERVICE_NAME)
+    except Exception as e:
+        log_state("FAIL", f"cannot delete the service — {e}")
+        if not _is_admin():
+            log("      removing a service needs administrator rights — "
+                "re-run from an elevated prompt")
+        return False, None
+    return True, f"service removed: {SERVICE_NAME}"
+
+
+def _service_host_main() -> int:
+    """Be the Windows service: hand the SCM a well-behaved supervised child.
+
+    The SCM insists on a process that calls ``StartServiceCtrlDispatcherW``
+    within 30 seconds and then answers control requests; a plain ``python.exe``
+    does neither, which is why ``sc create`` around one fails with error 1053.
+    This function supplies exactly that handshake and nothing else — the work
+    stays in ``start --foreground``, spawned as a child and watched, so the
+    SCM's restart policy sees a real exit code.
+
+    A stop request is not a failure: the child is killed and we exit 0, so the
+    failure actions do not resurrect a home the user just stopped.
+    """
+    try:
+        import servicemanager
+        # win32service is not optional here: SvcStop reads SERVICE_STOP_PENDING
+        # from it, and this module deliberately imports it lazily everywhere
+        # else, so leaving it out made the stop handler raise NameError at the
+        # first line — the report, the kill and the event were all skipped and
+        # the service stayed RUNNING, unstoppable, with nothing in the log.
+        import win32event
+        import win32service
+        import win32serviceutil
+    except ImportError as e:
+        # No console here, so log() would raise on a None stdout: the one place
+        # this line can go is the service log itself.
+        try:
+            HA_ROOT.mkdir(parents=True, exist_ok=True)
+            with open(SERVICE_LOG, "a", encoding="utf-8") as fh:
+                fh.write("[homeant] FAIL  pywin32 is required for service "
+                         f"mode — {e}\n")
+        except OSError:
+            pass
+        return 1
+
+    # Session 0 has no console: sys.stdout/sys.stderr are None, and the first
+    # print() inside a start the SCM cannot report would raise AttributeError.
+    # Rebind both before anything speaks.  The child gets *this* handle, not a
+    # second open() of the same path: two independent append streams each seek
+    # to EOF before writing on Windows, so the second writer overwrites the
+    # tail of the first — measured, the host's "service: starting hass" line
+    # came out as a stray "...ipts\python.exe)" fragment.  Inheriting one handle
+    # means one shared file position, and appends stay in order.
+    try:
+        HA_ROOT.mkdir(parents=True, exist_ok=True)
+        stream = child_log = open(SERVICE_LOG, "a", encoding="utf-8",
+                                  buffering=1)
+    except OSError:
+        stream = child_log = open(os.devnull, "w", encoding="utf-8")
+    sys.stdout = stream
+    sys.stderr = stream
+
+    state = {"rc": 0}
+    py = PROJECT_ROOT / ".venv" / "Scripts" / "python.exe"
+    script = PROJECT_ROOT / "scripts" / "homeant.py"
+
+    class _HomeAnt(win32serviceutil.ServiceFramework):
+        _svc_name_ = SERVICE_NAME
+        _svc_display_name_ = SERVICE_DISPLAY_NAME
+        _svc_description_ = SERVICE_DESCRIPTION
+
+        def __init__(self, args):
+            super().__init__(args)
+            self.stop_event = win32event.CreateEvent(None, 0, 0, None)
+            self.child: subprocess.Popen | None = None
+            self.stopping = False
+
+        def ServiceCtrlHandlerEx(self, control, event_type, data):
+            # Every control the SCM delivers lands here first.  Logged because
+            # `ControlService` answering 1061 ("cannot accept control at this
+            # time") cannot tell "the SCM never delivered it" apart from "we
+            # were called and did nothing" — and that difference is the whole
+            # diagnosis.  Volume is a line per start/stop, not per second.
+            log(f"service: control {control}")
+            return super().ServiceCtrlHandlerEx(control, event_type, data)
+
+        def SvcStop(self):
+            # First line, before anything that can raise: whether the control
+            # reached this instance at all is the fact worth having.  The
+            # parenthesis carries the second half of that fact — reporting
+            # returns *silently* when self.ssh is None, and killing returns
+            # silently when self.child is None, so a control delivered to an
+            # instance that never ran SvcDoRun looks exactly like one delivered
+            # here and then ignored.  Printing both handles is what tells the
+            # two apart.
+            child = self.child
+            log(f"service: stop requested (ssh={'set' if self.ssh else 'NONE'}, "
+                f"child={child.pid if child else 'NONE'})")
+            # Report first: the SCM gives a stop request 30s by default, and a
+            # service that says nothing for that long is terminated outright.
+            # Guarded because everything after it *is* the stop: an exception
+            # in this one call skipped the kill and the event and left a
+            # service that still reads RUNNING, refuses every further control
+            # with 1061, and cannot be stopped except by killing the process.
+            try:
+                self.ReportServiceStatus(win32service.SERVICE_STOP_PENDING,
+                                         waitHint=STOP_WAIT_SEC * 1000)
+            except Exception as e:
+                log_state("FAIL", f"service: cannot report STOP_PENDING — {e}")
+            self.stopping = True
+            try:
+                self._kill_child()
+            finally:
+                # The event must be set even if the kill raises.  A control
+                # handler that dies half-way leaves the service running with a
+                # stop already queued, and from then on the SCM refuses every
+                # further control with 1061 ("cannot accept control at this
+                # time") while the state still reads RUNNING — the service is
+                # then unstoppable except by killing the process.  Measured on
+                # this machine.
+                win32event.SetEvent(self.stop_event)
+
+        def _kill_child(self) -> None:
+            """End the whole tree: the wrapper is only the middle layer.
+
+            ``child.kill()`` would TerminateProcess the wrapper and leave hass —
+            its child — holding the venv and the port, which is the one outcome
+            a stop must never produce.  ``taskkill /T`` is the same call
+            ``_stop_pid`` makes for an unsupervised instance.
+            """
+            child = self.child
+            if child is None or child.poll() is not None:
+                return
+            subprocess.run(["taskkill", "/PID", str(child.pid), "/F", "/T"],
+                           capture_output=True,
+                           creationflags=_no_console_flags())
+            with contextlib.suppress(subprocess.TimeoutExpired):
+                child.wait(timeout=STOP_WAIT_SEC)
+
+        def SvcDoRun(self):
+            log(f"service: starting hass ({py})")
+            try:
+                self.child = subprocess.Popen(
+                    [str(py), str(script), "start", "--foreground"],
+                    stdin=subprocess.DEVNULL, stdout=child_log, stderr=child_log,
+                    cwd=str(PROJECT_ROOT), creationflags=_no_console_flags())
+            except OSError as e:
+                log_state("FAIL", f"cannot start hass — {e}")
+                state["rc"] = 1
+                return
+            while True:
+                rc = self.child.poll()
+                if rc is not None:
+                    break
+                # Both signals are checked, not just the event: if SetEvent ever
+                # fails to reach this thread, depending on the event alone means
+                # waiting forever while the SCM shows RUNNING and refuses every
+                # control with 1061.  The flag is set by the control thread
+                # before it touches the child, so it is the cheaper witness.
+                if self.stopping or (win32event.WaitForSingleObject(
+                        self.stop_event, 1000) == win32event.WAIT_OBJECT_0):
+                    self._kill_child()
+                    rc = 0
+                    break
+            log(f"service: hass exited with {self.child.returncode}")
+            if self.stopping or not rc:
+                # Neither a stop the user asked for nor a clean exit is a
+                # failure: returning reports SERVICE_STOPPED with 0 and the
+                # failure actions stay quiet, which is exactly what a home the
+                # user just stopped needs.
+                return
+            # hass died on its own with a non-zero code, so the SCM has to see
+            # a failure or it will not restart anything.  Returning normally
+            # reports STOPPED with exit code 0, i.e. "stopped on purpose" —
+            # measured on this machine: flags=True, 3x RESTART/10s configured,
+            # and the service still sat at (STOPPED, dwWin32ExitCode=0) for
+            # minutes after hass was killed.  The failure *actions* only fire
+            # when the exit code is non-zero, which is the one thing
+            # FailureActionsOnNonCrashFailures is about.
+            try:
+                self.ReportServiceStatus(
+                    win32service.SERVICE_STOPPED,
+                    win32ExitCode=WIN_ERROR_SERVICE_SPECIFIC,
+                    svcExitCode=rc)
+            except Exception as e:
+                log_state("FAIL", f"service: cannot report the failure — {e}")
+            # os._exit rather than return: pywin32's dispatcher reports STOPPED
+            # one more time, with 0, as soon as SvcDoRun returns, which would
+            # overwrite the code just reported.  Flush first — os._exit skips
+            # every buffer flush there is, and the line above is the evidence
+            # the next start needs.
+            try:
+                sys.stdout.flush()
+            except Exception:
+                pass
+            os._exit(rc)
+
+    try:
+        servicemanager.Initialize()
+        servicemanager.PrepareToHostSingle(_HomeAnt)
+        servicemanager.StartServiceCtrlDispatcher()
+    except Exception as e:
+        log_state("FAIL", f"cannot talk to the service manager — {e}")
+        return 1
+    return state["rc"]
 
 
 # ── config deployment ─────────────────────────────────────────────────────────
@@ -1065,7 +2707,10 @@ def _sync_storage_entries(tpl: dict, cur: dict) -> bool:
     if not pairs:
         return False
 
-    if _ha_instance():
+    if _ha_instance() or _hass_via_service():
+        # Rewriting a live instance's .storage is undone by its next flush, and
+        # `_hass_via_service()` covers the case where the lock is gone and no
+        # pid can be named: the home is up either way.
         return False
     for hit, te, wholesale in pairs:
         if wholesale:
@@ -1507,20 +3152,84 @@ def cmd_status(args) -> int:
     # deleted while hass kept serving from memory, start found the process by
     # scanning and said "running" while status, left with a deleted pid file,
     # said "not running" and blamed a stranger for holding the port.
+    #
+    # Two questions now that T11 removed the scan.  The lock names the pid when
+    # it can; when it cannot, the supervisor plus a bound port still prove an
+    # instance of ours is up — and saying so is the only way to keep that case
+    # from reading as "some stranger has 8123".
     listening = port_in_use(PORT)
-    # The scan is the expensive half — seconds on Windows, where it walks the
-    # process table through PowerShell — so it only runs when something could
-    # actually be found: a free port means no serving instance, whatever the
-    # records say.
     pid = _ha_instance() if listening else None
     if pid:
         log(f"hass: running (PID {pid})")
+    elif listening and _hass_via_service():
+        log("hass: running (via service)")
     else:
         all_ok = False
         if listening:
-            log(f"FAIL  hass: not running — port :{PORT} held by another process")
+            log(f"FAIL  hass: not running — port {PORT} held by another process")
         else:
             log(f"FAIL  hass: not running")
+
+    # The supervisor's state, and deliberately short: three states plus one
+    # suffix.  The suffix says autostart is unambiguously off — a choice the
+    # user made with `disable`, not a fault, so it is not a FAIL marker and it
+    # does not touch the exit code.  `hass:` above answers "is the process
+    # there" and nothing else: folding the two together would make "not
+    # running" ambiguous between "never came back" and "came back and stopped".
+    # Position matters as much as wording — "hass: not running" and "service:
+    # not installed" have completely different fixes, so the cause sits directly
+    # under the symptom.
+    kind = _service_kind()
+    autostart_off = " (autostart off)" if _autostart_state() is False else ""
+    if kind == "service":
+        if not _win_service_installed():
+            log("service: not installed")
+        else:
+            # Three states, no more.  The SCM has no "failed" state — a service
+            # that exited nonzero is simply stopped — and a pending transition
+            # reports "stopped" because the line above already says whether hass
+            # is answering.  Ownership is not checked here either: the parent
+            # link that answers it on Linux needs /proc.
+            log(f"service: {'running' if _win_service_state() == 'running' else 'stopped'}"
+                f"{autostart_off}")
+    elif kind == "launchd":
+        if not UNIT_PATH.exists():
+            log("service: not installed")
+        else:
+            state, main = _launchd_info()
+            if state == "running":
+                log(f"service: running{autostart_off}")
+                # launchd names the wrapper's pid, not hass's, exactly like
+                # MainPID — so the same parent-link test decides ownership.
+                if pid and main and _parent_pid(pid) != main:
+                    log(f"WARN  service: does not own hass (PID {pid}) — run: homeant stop then start")
+            else:
+                # No "failed" state here: launchd just stops the job, and
+                # KeepAlive has already retried it one ThrottleInterval later.
+                # HA's own log lives in HA_ROOT — `homeant logs` is the
+                # diagnostic path here; there is no journal to point at.
+                log(f"service: stopped{autostart_off}")
+    elif kind != "systemd-user" or not UNIT_PATH.exists():
+        log("service: not installed")
+    else:
+        r = _systemctl("is-active", SERVICE_NAME)
+        state = ((r.stdout or "").strip() if r is not None else "") or "inactive"
+        if state == "active":
+            log(f"service: running{autostart_off}")
+            main = _service_main_pid()
+            # MainPID is the wrapper, never hass, so ownership is decided by the
+            # parent link; comparing the two pids directly would warn on every
+            # healthy host.
+            if pid and main and _parent_pid(pid) != main:
+                log(f"WARN  service: does not own hass (PID {pid}) — run: homeant stop then start")
+        else:
+            log(f"service: stopped{autostart_off}")
+            if state == "failed":
+                # "failed" is the unit's last result, not necessarily a failed
+                # start: a stop that ends in a non-zero exit lands here too, so
+                # the line names the state and points at the journal instead of
+                # claiming which half went wrong.
+                log("WARN  service: failed — journalctl --user -u homeant -n 20")
 
     # OAuth gets no success badge either, and deliberately no effect on the exit
     # code: it is the one stage that waits on a browser, so "not configured"
@@ -1530,18 +3239,29 @@ def cmd_status(args) -> int:
     # request is spent finding out.
     #
     # A flow that is still open is reported apart from a missing one, because
-    # the storage file cannot tell them apart and the user's next move differs.
-    # "unfinished" means the flow exists but never created its entry — the
-    # browser step is already done (or the URL was never opened), and the entry
-    # is one `start` away.  Calling that "not configured" sends the user back to
-    # redo an authorization they already gave, which is the exact confusion this
-    # line exists to prevent.  .xiaomi-flow is written when a flow is created and
-    # unlinked when it succeeds or goes stale, so it is honest evidence at the
-    # price of one stat() — no request, no token.
+    # the storage file cannot tell them apart and the user's next move differs:
+    # one wants the login page, the other only a form nobody is looking at.
+    #
+    # Where the flow is parked cannot be read from disk — data_entry_flow keeps
+    # no store, and core.config_entries holds entries only — so the one way to
+    # ask is `GET /api/config/config_entries/flow/{id}` (200 for a known id;
+    # the list endpoint is POST-only).  That costs one loopback request, spent
+    # only when the marker exists, and it never mints a token or logs in: the
+    # cached LLAT is used as-is.  Every failure — no token, hass down, 404 after
+    # a restart — falls back to the wording that is true either way, so the line
+    # is never worse than the stat() it replaced.
     if _xiaomi_already_configured():
         log("oauth: xiaomi_home configured")
     elif XIAOMI_FLOW_FILE.exists():
-        log("WARN  oauth: xiaomi_home flow unfinished — run: homeant start to finish it")
+        state = _xiaomi_flow_state()
+        if state == "authorizing":
+            log("WARN  oauth: xiaomi_home waiting for authorization — run: homeant start to open the login page")
+        elif state == "advancing":
+            log("WARN  oauth: xiaomi_home authorized, entry not created — run: homeant start to finish it")
+        elif state == "lost":
+            log("WARN  oauth: xiaomi_home flow no longer exists — run: homeant start to begin again")
+        else:
+            log("WARN  oauth: xiaomi_home flow unfinished — run: homeant start to finish it")
     else:
         log("WARN  oauth: xiaomi_home not configured (run: homeant start)")
 
@@ -1634,12 +3354,15 @@ def _finish_setup(mcp_cfg: str | None, mcp_fail: dict | None = None) -> int:
     without running the next one, and nothing is cached between runs, so the
     sequence resumes from the top every time and is idempotent by construction.
 
-    1. **hosts** (WSL only) — the Windows hosts file must map
-       ``homeassistant.local`` to 127.0.0.1.  Every other platform ignores this
-       stage: HA's own zeroconf broadcast does the job there.  Consulted only
-       while OAuth is still incomplete — once the config entry exists the
-       callback host is history, so a finished install goes straight to MCP
-       instead of demanding a hosts entry forever.
+    1. **hosts** (WSL only) — the Windows hosts file must map both names to
+       127.0.0.1.  Every other platform ignores this stage: HA's own zeroconf
+       broadcast does the job there.  No networking mode is exempt — measured
+       11-10 under ``mirrored``: the host still could not resolve the guest's
+       own announcements even with the A record forced to ``127.0.0.1``, while
+       other LAN devices resolved fine.  Consulted only while OAuth is still
+       incomplete — once the config entry exists the callback host is history,
+       so a finished install goes straight to MCP instead of demanding a hosts
+       entry forever.
     2. **oauth** — xiaomi_home must have a config entry.  Never waited on: the
        run advances the flow as far as it goes, surfaces the URL, and returns
        pending.  MCP is NOT printed here — setup is not done.
@@ -1654,7 +3377,12 @@ def _finish_setup(mcp_cfg: str | None, mcp_fail: dict | None = None) -> int:
         # there is no flow left to resume.
         XIAOMI_FLOW_FILE.unlink(missing_ok=True)
     else:
-        # ── stage 1: callback host (WSL only) ────────────────────────────────
+        # ── stage 1: callback host (WSL, every networking mode) ──────────────
+        # No mode is exempt.  Under ``mirrored`` — the one mode documented to
+        # carry multicast onto the LAN — the Windows host still could not
+        # resolve the guest's own announcements (measured 11-10, both with the
+        # A record at the guest's address and forced to 127.0.0.1), while the
+        # same host resolved other LAN devices normally.
         if is_wsl() and not _hosts_has_ha_local():
             log_state("PENDING", "add the hosts entry, then re-run")
             # WSL cannot write it: the 9p server re-applies the Windows ACL even
@@ -1721,6 +3449,133 @@ def _finish_setup(mcp_cfg: str | None, mcp_fail: dict | None = None) -> int:
     return 0
 
 
+def _run_foreground() -> int:
+    """Run hass in the foreground and exit with its status.
+
+    This is the contract handed to every supervisor — systemd, launchd, the
+    Windows SCM, docker.  They own start-at-boot, restart-on-crash and log
+    collection; all this layer does is keep hass attached to the same process
+    tree and turn one stop signal into an orderly shutdown.
+
+    Deliberately *not* the orchestrator: no release probe, no unit writing, no
+    MCP token, no setup gates, no config reconcile.  Those belong to the plain
+    ``start``, and repeating them here would run them again on every crash
+    restart — and, on the network probe, would stall a reboot behind a timeout.
+    The one exception is waiting for a local address (``_wait_for_ipv4``), which
+    is a precondition of hass rather than of the install: it is bounded, silent
+    when there is nothing to wait for, and it has to sit where every supervisor
+    will run it.
+    """
+    HA_ROOT.mkdir(parents=True, exist_ok=True)
+
+    # One instance per HA_ROOT.  A second hass fails its 8123 bind halfway
+    # through start-up and leaves a half-written .storage behind, so refuse
+    # before spawning — and say which of the two cases this is, because the
+    # fixes differ.
+    pid = _ha_instance()
+    if pid:
+        log_state("FAIL", f"hass already running (PID {pid}) — stop it first: homeant stop")
+        return 1
+    if _hass_via_service():
+        # Same refusal, different evidence: the supervisor owns an instance and
+        # something answers on 8123, but the lock cannot name the pid.  Falling
+        # through would let this foreground run fight it for the socket.
+        log_state("FAIL", "hass is already running under the service — "
+                          "stop it first: homeant stop")
+        return 1
+    if port_in_use(PORT):
+        log_state("FAIL", f"port {PORT} is already in use by another program — "
+                          f"stop it first, a second instance would fail its bind")
+        return 1
+
+    hb = hass_bin()
+    if hb is None:
+        # Foreground mode never installs anything: the supervisor's restart
+        # policy would turn a download into an invisible retry loop, and the
+        # installer is the only thing allowed to replace a tree.
+        log_state("FAIL", "hass is not installed in this tree — run 'homeant start' once "
+                          "(or uv sync) before using --foreground")
+        return 1
+
+    # Bounded wait for a local address: hass refuses to set up zeroconf without
+    # one, and a supervisor's boot start runs before DHCP is done.  Here rather
+    # than in the unit because systemd, launchd, the SCM and docker all pass
+    # through this function, while the unit text is per-platform.
+    _wait_for_ipv4()
+
+    cmd = [str(hb), "--ignore-os-check", "--config", str(HA_ROOT)]
+    # stdout/stderr are inherited on purpose: journald and `docker logs` want
+    # hass's own lines, not ours relayed through a pipe.  No start_new_session
+    # either — the supervisor's cgroup/job must be able to collect the whole
+    # tree when it stops this process.
+    try:
+        child = subprocess.Popen(cmd, creationflags=_no_console_flags())
+    except OSError as e:
+        log_state("FAIL", f"cannot start hass — {e}")
+        return 1
+
+    log(f"foreground: hass PID {child.pid} — send SIGTERM here to stop it")
+
+    forward = {"signum": 0, "at": 0.0, "killed": False}
+
+    def _on_signal(signum, _frame) -> None:
+        """Forward the first stop signal; ignore the rest.
+
+        A second Ctrl+C must not shorten hass's flush window — .storage is being
+        rewritten at that moment, and `homeant stop` would have waited the full
+        STOP_WAIT_SEC for exactly this reason.
+        """
+        if forward["signum"]:
+            return
+        forward["signum"] = signum
+        forward["at"] = time.monotonic()
+        log("foreground: stopping hass ...")
+        try:
+            if IS_WIN:
+                # Windows hass has no console to receive Ctrl+C and no signal to
+                # catch, so TerminateProcess is the only stop there is — the
+                # same conclusion _stop_pid reached for /F.
+                child.kill()
+            else:
+                child.send_signal(signal.SIGTERM)
+        except OSError:
+            pass        # already gone; wait() below reports how it went
+
+    saved: dict = {}
+    for name in ("SIGTERM", "SIGINT"):
+        sig = getattr(signal, name, None)
+        if sig is None:
+            continue
+        try:
+            saved[sig] = signal.signal(sig, _on_signal)
+        except (OSError, ValueError, RuntimeError):
+            pass        # not the main thread, or the platform refuses this one
+
+    try:
+        while True:
+            try:
+                rc = child.wait(timeout=1.0)
+                break
+            except subprocess.TimeoutExpired:
+                if (forward["signum"] and not forward["killed"]
+                        and time.monotonic() - forward["at"] > STOP_WAIT_SEC):
+                    forward["killed"] = True
+                    log(f"foreground: hass ignored the stop signal for {STOP_WAIT_SEC}s — killing it")
+                    with contextlib.suppress(OSError):
+                        child.kill()
+    finally:
+        for sig, old in saved.items():
+            with contextlib.suppress(OSError, ValueError, RuntimeError):
+                signal.signal(sig, old)
+
+    if rc < 0:
+        # Died by a signal: report the shell convention (128+n) rather than -n,
+        # so the number a supervisor logs matches what an operator would see.
+        rc = 128 + (-rc)
+    log(f"foreground: hass exited with {rc}")
+    return rc
+
+
 def cmd_start(args) -> int:
     """Start hass, first bringing the install up to date.
 
@@ -1729,6 +3584,16 @@ def cmd_start(args) -> int:
     nothing left to do.
     """
     global SPAWNED_PID
+    # Supervisor mode, first of all: the unit's ExecStart runs exactly this
+    # command, and it must behave like a well-mannered child — no network
+    # probe, no installer hand-off, no gates, and no exit until hass does.
+    if getattr(args, "foreground", False):
+        return _run_foreground()
+    # The SCM host: same "be a well-mannered child" contract as --foreground,
+    # one layer up, and equally free of gates, probes and setup stages.
+    if getattr(args, "service_host", False):
+        return _service_host_main()
+
     # Version check comes first: a newer release may ship a different
     # dependency probe, so the old build must not be the one deciding whether
     # this host is usable. Detection is read-only — nothing is touched until
@@ -1765,12 +3630,127 @@ def cmd_start(args) -> int:
 
     HA_ROOT.mkdir(parents=True, exist_ok=True)
 
+    # Which supervisor this host has decides the whole launch path, and it is
+    # decided before anything is stopped: "hass running with no unit" needs a
+    # hand-over stop, "unit owns hass" must not be stopped at all, and a stop
+    # between the two verdicts would leave neither state.
+    svc = _service_kind()
+
+    # Privilege gate, at the entry and before anything is touched.  Keeping the
+    # home alive across a reboot is the one thing this design cannot do
+    # unprivileged, and finding that out *after* a successful start is how a
+    # promise becomes a postscript.  Refuse up front, name the exact command,
+    # and leave the tree exactly as it was — the user fixes it in one line and
+    # re-runs.  There is no "warning" variant of this verdict on purpose: a
+    # start that cannot survive a reboot is not a start this layer may report
+    # as done, whatever loginctl's wording happens to be.
+    if svc == "systemd-user" and not _linger_ensure():
+        return 1
+
+    # Windows has a gate of the same shape for a different reason: the
+    # registration lives in HKLM, so creating it needs administrator rights, and
+    # an unattended `start` can never answer a UAC dialog.  Say it before
+    # anything is touched — the files are already in place at this point, and
+    # re-running the same command from an elevated prompt is the whole fix.
+    if svc == "service" and not _service_registered() and not _is_admin():
+        # The two lines are read together: "run as administrator" is the
+        # condition, the command is what to run *once you are*.  The command is
+        # deliberately the plain relative one — an absolute path or a
+        # Start-Process incantation is harder to retype than to remember, and
+        # this process still cannot elevate itself without blocking on a
+        # prompt, which the design forbids everywhere.
+        log_state("FAIL", "run as administrator")
+        log("      run: .\\homeant start")
+        return 1
+
+    # An elevated `start` is the only moment this user can reach the SCM, so
+    # spend it on the one setting an upgrade cannot reach.  A service registered
+    # by an earlier build has the failure *actions* but not the flag that makes a
+    # non-zero exit count as a failure, so a dead hass is never restarted.
+    #
+    # It sits before the "already running" branch on purpose: repairing a live
+    # install is exactly how a user meets it, and that branch returns before
+    # _win_service_ensure ever runs (measured on the real machine: an elevated
+    # `start` on a running home printed nothing at all).  Guarded by _is_admin()
+    # so the unprivileged path still makes zero SCM calls.
+    if svc == "service" and _is_admin():
+        _win_ensure_crash_recovery()
+
+    # Windows counterpart of the autostart gate above, for a platform where the
+    # change needs a right this prompt may not hold.  Two facts decide it: the
+    # registry says the service is demanded-only (free to read), and this prompt
+    # is not elevated.  Failing here is the point — bringing hass up first and
+    # then admitting autostart stays off would be the half-success that makes
+    # `start` and `disable` disagree about what "done" means.  A missing value
+    # means "could not read", not "needs fixing", so it never blocks a start.
+    if svc == "service" and _win_service_installed():
+        start_type = _win_reg_value("Start")
+        if start_type not in (None, "2"):
+            if not _is_admin():
+                log_state("FAIL", "run as administrator")
+                log("      the service is set to start on demand — "
+                    "putting it back to automatic needs an elevated prompt")
+                log("      run: .\\homeant start")
+                return 1
+            if not _win_service_set_start(True):
+                return 1
+
+    # Autostart is part of what this verb promises: `start` means "serve the
+    # release, and keep serving it after a reboot", and `disable` is the only
+    # way out of that.  It therefore belongs *before* the "already running"
+    # branch below, which returns early: a home left disabled but still running
+    # would otherwise answer "already running", return, and never get its
+    # autostart back — silently breaking this verb's own contract.  The cost is
+    # one `systemctl is-enabled` per start, spent only when a unit exists.
+    if svc == "systemd-user" and UNIT_PATH.exists() and not _service_enable():
+        # Nothing was started or stopped here: a home that is already running
+        # keeps running, it just will not come back at the next boot.
+        return 1
+
+    # macOS counterpart of the gate above.  launchd's `disable` is a mask, so a
+    # label left disabled cannot be bootstrapped at all — it answers with a bare
+    # "5: Input/output error" (measured 11-07).  Clearing the record here means
+    # the cold path below finds a loadable label, and the running path (which
+    # returns early) still restores the setting it is responsible for.
+    if svc == "launchd" and UNIT_PATH.exists() and not _launchd_set_enabled(True):
+        return 1
+
     # `start` is idempotent: a running hass already *is* the state we were asked
     # for, so stopping it would only interrupt the user.  Hand-edited config
     # therefore needs an explicit stop + start, not a bare `start`.
+    #
+    # Two witnesses for "running", because T11 removed the process scan: the
+    # lock names the pid, and when the lock cannot (deleted while hass keeps
+    # serving from memory) the supervisor plus a bound port still prove that an
+    # instance of ours is up — the service cannot be alive with its hass dead,
+    # and 8123 is the only port this home ever binds.
     pid = _ha_instance()
+    running = bool(pid) or _hass_via_service()
     if pid:
         log(f"hass already running (PID {pid})")
+    elif running:
+        log("hass already running (via service)")
+
+    # A hass started by a build that had no service still answers on 8123, so
+    # starting the supervisor would fail its bind while this process reported
+    # "already running" and returned — the tree would stay one version behind
+    # forever.  Stop it, then let the cold path bring it up the new way.
+    #
+    # T11 wanted this gone, and it cannot be: the audit found that removing it
+    # makes a pre-service tree unable to ever register (the idempotent branch
+    # above returns first).  `_stop_own_hass` reaches its pid branch here by
+    # definition — the condition itself says nothing is registered.
+    if running and svc in ("systemd-user", "service", "launchd") and not _service_registered():
+        manager = {"systemd-user": "systemd", "service": "the Windows service",
+                   "launchd": "launchd"}[svc]
+        log(f"hass running outside the service manager — "
+            f"moving it under {manager}")
+        if not _stop_own_hass():
+            log_state("FAIL", "the running hass did not exit — "
+                              "cannot hand it over to the service manager")
+            return 1
+        pid = None
+        running = False
 
     # A hass still running out of a HA_ROOT that lost its configuration.yaml is
     # answering from memory alone: .storage writes fail, so every stage below
@@ -1778,17 +3758,23 @@ def cmd_start(args) -> int:
     # state `start` was asked for, so it recovers instead of reporting — stop,
     # fall through, and let the cold path deploy the seed again.  Same predicate
     # `status` uses for its FAIL line: one fact, so the two cannot disagree.
-    if pid and not _seed_present():
+    #
+    # The stop goes to the supervisor when there is one: killing its child
+    # directly is indistinguishable from a crash, and the SCM/systemd would
+    # restart the home about ten seconds later — in the middle of this redeploy
+    # (measured on Windows: exit code 1066 plus the failure actions).
+    if running and not _seed_present():
         log(f"hass running without configuration.yaml under {HA_ROOT} — redeploying")
-        if not _stop_pid(pid):
+        if not _stop_own_hass():
             # Deploying under a live hass would be undone by its own shutdown
             # flush, so this path stops rather than tries.
-            log_state("FAIL", f"hass (PID {pid}) did not exit — "
-                              f"cannot redeploy its configuration under it")
+            log_state("FAIL", "the running hass did not exit — "
+                              "cannot redeploy its configuration under it")
             return 1
         pid = None
+        running = False
 
-    if pid:
+    if running:
         # The three setup stages are still owed, and this rerun is exactly how a
         # first install resumes: the user just added the hosts entry or finished
         # OAuth in a browser.  Returning `status` here would answer a question
@@ -1806,11 +3792,12 @@ def cmd_start(args) -> int:
             # the same pass, which also bounds the recovery to one attempt (the
             # cold path never returns here).
             log("admin user missing from the password store — re-provisioning")
-            if not _stop_pid(pid):
-                log_state("FAIL", f"hass (PID {pid}) did not exit — cannot re-provision its "
-                                  f"admin account under a running instance")
+            if not _stop_own_hass():
+                log_state("FAIL", "the running hass did not exit — cannot re-provision "
+                                  "its admin account under a running instance")
                 return 1
             pid = None
+            running = False
         else:
             _wait_for_ha_running()
             return _finish_setup(_ensure_mcp_ready(mcp_fail, tok=tok), mcp_fail)
@@ -1840,32 +3827,71 @@ def cmd_start(args) -> int:
     assert hb is not None
     cmd = [str(hb), "--ignore-os-check", "--config", str(HA_ROOT)]
 
-    log_partial("starting hass ")
+    if svc == "none":
+        # Containers and bare hosts: nothing to register with, and inventing a
+        # supervisor is what this design refuses to do.  Say the one thing that
+        # is actionable and carry on the old way.  Printed before the progress
+        # line, which is a partial line waiting for its first dot.
+        log("no service manager here — to supervise it yourself: ./homeant start --foreground")
+
     t_boot = time.monotonic()
 
-    if IS_WIN:
-        _DETACHED_PROCESS = 0x00000008
-        _CREATE_NO_WINDOW = 0x08000000
-        _CREATE_NEW_PROCESS_GROUP = 0x00000200
-        _STARTF_USESHOWWINDOW = 0x00000001
-        _SW_HIDE = 0
-        si = subprocess.STARTUPINFO()
-        si.dwFlags = _STARTF_USESHOWWINDOW
-        si.wShowWindow = _SW_HIDE
-        p = subprocess.Popen(
-            cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-            creationflags=_DETACHED_PROCESS | _CREATE_NO_WINDOW | _CREATE_NEW_PROCESS_GROUP,
-            close_fds=True, startupinfo=si,
-        )
+    if svc == "systemd-user":
+        # From here the unit is the only start source: install, enable, start,
+        # then wait for HTTP exactly as the spawned case does.  Popen here would
+        # put two owners on one port — and systemd would then keep racing us.
+        child_pid = _service_up()
+        if not child_pid:
+            return 1
+        alive = _service_active
+    elif svc == "service":
+        # The SCM is the only start source on Windows, for the same reason, and
+        # the gate above guaranteed there is a registration to start (or the
+        # rights to create one).  `_win_service_ensure` usually has nothing to
+        # do: ImagePath and the profile value already point at this tree.
+        if not _win_service_ensure():
+            return 1
+        if not _win_service_start():
+            _win_reap()
+            return 1
+        # The SCM reports no MainPID — hass writes its own lock, and the ready
+        # branch below reads the pid from there, exactly as `status` does.
+        child_pid = 0
+        alive = lambda: _win_service_state() == "running"  # noqa: E731
+    elif svc == "launchd":
+        # Same rule as systemd: once the plist exists, launchd is the only
+        # start source, and a Popen here would put two owners on one port.
+        # launchd does report a pid, but it is the wrapper's — the log line
+        # below wants hass's, which the ready branch reads from the lock.
+        child_pid = _service_up_launchd()
+        if not child_pid:
+            return 1
+        alive = _launchd_active
     else:
+        # No supervisor at all (containers and bare hosts).  The detached spawn
+        # is the last resort on purpose: two start sources on one port is the
+        # failure this whole section exists to prevent, so it only runs where
+        # there is nothing to register with.
         p = subprocess.Popen(
             cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-            start_new_session=True,
+            start_new_session=True, creationflags=_no_console_flags(),
         )
+        child_pid = p.pid
+        # Only a child *this* process launched may be killed by its atexit hook.
+        # In service mode SPAWNED_PID deliberately stays 0: hass belongs to the
+        # supervisor, and killing it on our way out would look like a crash and
+        # trigger the restart policy.
+        SPAWNED_PID = child_pid
+        if callable(globals().get("_mark_we_started_hass")):
+            _mark_we_started_hass()  # type: ignore[name-defined]  # noqa: F821  (monkey-patched by _register_cleanup)
+        alive = lambda: pid_exists(child_pid)  # noqa: E731
 
-    SPAWNED_PID = p.pid
-    if callable(globals().get("_mark_we_started_hass")):
-        _mark_we_started_hass()  # type: ignore[name-defined]  # noqa: F821  (monkey-patched by _register_cleanup)
+    # The progress line opens *after* the start verb, not before it: registering
+    # the service prints "service installed: …" exactly once, and that line used
+    # to land inside this half-finished one — `starting hass [homeant] service
+    # installed: homeant`, dots on a line of their own.  Anything the supervisor
+    # has to say about itself belongs above the wait, not in the middle of it.
+    log_partial("starting hass ")
 
     # wait for HA ready - one dot per second, same cadence as the installer's
     # extract ticker: a cold start takes tens of seconds and a silent console
@@ -1882,12 +3908,19 @@ def cmd_start(args) -> int:
     # "did not come up".  Only the clock got longer: a dead process still
     # breaks out on the next tick, so a genuinely broken boot is reported just
     # as fast as before.
-    for _ in range(300):
+    for _ in range(SERVICE_START_TIMEOUT):
         log_tick()
         time.sleep(1)
-        if pid_exists(p.pid) and _hass_serving():
+        if alive() and _hass_serving():
             print(flush=True)
-            log(f"hass started (PID {p.pid}, ready in {time.monotonic() - t_boot:.1f}s)")
+            if not child_pid:
+                # Only the Windows service path lands here: the SCM reports no
+                # MainPID, so the pid comes from HA's own lock file — the same
+                # record `status` reads.  Zero means it was not written yet;
+                # "service" then names the owner honestly instead of "PID 0".
+                child_pid = _ha_instance() or 0
+            who = f"PID {child_pid}" if child_pid else "service"
+            log(f"hass started ({who}, ready in {time.monotonic() - t_boot:.1f}s)")
             # Two separate moments, in this order:
             #
             # 1. Mint/cache the MCP token BEFORE the RUNNING gate: the gate
@@ -1905,10 +3938,18 @@ def cmd_start(args) -> int:
             tok = _mcp_token(fail=mcp_fail)
             _wait_for_ha_running(t0=t_boot)
             return _finish_setup(_ensure_mcp_ready(mcp_fail, tok=tok), mcp_fail)
-        if not pid_exists(p.pid):
+        if not alive():
             break
     print(flush=True)
     log_state("FAIL", f"hass did not come up — check {HASS_LOG}")
+    if svc == "systemd-user":
+        # Restart=on-failure would retry every 10s from here, invisibly, while
+        # the port stays free and nothing explains why.
+        _service_reap()
+    elif svc == "service":
+        # Same reason: the SCM's failure actions would keep restarting a home
+        # that cannot boot, and the evidence is in the service log.
+        _win_reap()
     return 1
 
 
@@ -1936,7 +3977,8 @@ def _stop_pid(pid: int) -> bool:
     """
     log(f"stopping hass (PID {pid}) ...")
     if IS_WIN:
-        subprocess.run(["taskkill", "/PID", str(pid), "/F", "/T"], capture_output=True)
+        subprocess.run(["taskkill", "/PID", str(pid), "/F", "/T"],
+                       capture_output=True, creationflags=_no_console_flags())
         for _ in range(20):
             if not pid_exists(pid):
                 return True
@@ -1970,16 +4012,298 @@ def _stop_pid(pid: int) -> bool:
 
 
 def cmd_stop(args) -> int:
+    """Stop the home.  Registration and autostart both stay as they are.
+
+    One verb, spelled the same way on every platform, because the underlying
+    operation is the same one everywhere: end the process.  ``systemctl stop``,
+    ``launchctl bootout`` and ``SERVICE_CONTROL_STOP`` differ in name only, and
+    each is the *single* word its supervisor has for it.
+
+    ``disable`` is deliberately not part of it.  Autostart is a property of the
+    registration, not of this run, and the three platforms cannot agree on who
+    may change it: `systemctl --user disable` and `launchctl disable` are
+    unprivileged, while changing a Windows service's start type needs
+    ``SERVICE_CHANGE_CONFIG`` — the same right that would let its holder repoint
+    the binary somewhere else (measured 11-07: ``OpenService`` with that mask →
+    access denied for a plain user, and install grants ``IU`` only ``RP``/``WP``
+    for exactly this reason).  Disabling here would therefore mean doing it on
+    two platforms and quietly not doing it on the third — one flag, three
+    behaviours.  So it happens in neither: ``uninstall`` removes the
+    registration, and a removed registration does not come back.
+
+    Consequence, stated plainly rather than discovered later: a stopped home
+    that is still installed starts again at the next boot or GUI login.
+
+    Measured 11-05: leaving the unit enabled does *not* bring the process back
+    by itself either — ``Restart=on-failure`` reacts to unexpected exits, and a
+    stop request is an expected one — so there is nothing to undo here and no
+    ordering trick to play.
+
+    Linger is left untouched too: it says whether the user's manager survives a
+    logout, which has nothing to do with this home.
+
+    An unregistered tree — and any host with no supervisor at all — keeps the
+    old path exactly: find the process, kill it, wait for it to be gone.
+    """
+    service_stopped = False
+    if _service_kind() == "systemd-user" and UNIT_PATH.exists():
+        r = _systemctl("stop", SERVICE_NAME)
+        if r is None or r.returncode != 0:
+            # Silence here would read as "stopped" while systemd keeps the
+            # home alive behind us — the one outcome this must never fake.
+            chatter = ((r.stderr or "") + (r.stdout or "")).strip() if r else ""
+            why = (chatter.splitlines()[-1] if chatter
+                   else f"systemctl exited {r.returncode}" if r
+                   else "systemctl is unavailable")
+            log_state("FAIL", f"cannot stop the service — {why}")
+            return 1
+        service_stopped = True
+    elif _service_kind() == "service" and _win_service_installed():
+        # Same one verb as Linux.  Start-at-boot was set once at install and is
+        # left alone here — see the docstring for why it cannot be otherwise.
+        if not _win_service_stop():
+            return 1
+        service_stopped = True
+    elif _service_kind() == "launchd" and UNIT_PATH.exists():
+        # Same one verb again: `bootout` unloads the job and leaves the plist in
+        # place.  `launchctl disable` exists and is unprivileged, but it is not
+        # used here on purpose — the contract is identical on all three
+        # platforms, and "stays stopped across a reboot" belongs to `uninstall`.
+        if not _launchd_bootout():
+            return 1
+        service_stopped = True
+
+    # Asked *after* the supervisor, and by the same predicate start and status
+    # use: a hass the unit never owned (a bare `start` from before this tree was
+    # registered) is still ours to stop.
     pid = _ha_instance()
     if not pid:
-        log("hass not running")
+        log("hass stopped" if service_stopped else "hass not running")
         return 0
 
     if not _stop_pid(pid):
         log_state("FAIL", f"hass (PID {pid}) is still running — "
                           f"it may be stuck in shutdown; try again or kill it by hand")
+        # A hass the service left behind runs as LocalSystem, so taskkill is
+        # refused outright — measured: rc=255, "access denied" — and a hand-run
+        # kill from the same window is refused for the same reason.  Saying so
+        # beats repeating advice that cannot work here.
+        if IS_WIN and not _is_admin():
+            log("      if it belongs to the service, killing it needs an elevated prompt")
         return 1
     log("hass stopped")
+    return 0
+
+
+def cmd_disable(args) -> int:
+    """Turn off start-at-boot.  The running home is not touched.
+
+    The mirror image of what `start` does to autostart, and one of only two
+    verbs that change it (`uninstall` is the other, by removing the
+    registration).  `stop` deliberately does not, on every platform and for the
+    same reason: it ends a process and nothing else.
+
+    Calling `start` afterwards turns autostart back on.  That is the documented
+    price of keeping `start` as the single "make this host serve" verb, so the
+    help text says it instead of letting it be discovered.
+
+    A host with no registration has nothing to disable.  That is a failure
+    rather than a quiet no-op: the only reason to run this verb is to change a
+    boot setting, so answering "done" when there is none would be a lie.
+    """
+    kind = _service_kind()
+    if kind == "systemd-user":
+        if not UNIT_PATH.exists():
+            log_state("FAIL", "nothing is registered — run: homeant start first")
+            return 1
+        if not _service_disable():
+            return 1
+        log("autostart off")
+        return 0
+    if kind == "service":
+        if not _win_service_installed():
+            log_state("FAIL", "nothing is registered — run: homeant start first")
+            return 1
+        if not _win_service_set_start(False):
+            return 1
+        log("autostart off")
+        return 0
+    if kind == "launchd":
+        if not UNIT_PATH.exists():
+            log_state("FAIL", "nothing is registered — run: homeant start first")
+            return 1
+        if not _launchd_set_enabled(False):
+            return 1
+        log("autostart off")
+        return 0
+    log_state("FAIL", "nothing is registered — run: homeant start first")
+    return 1
+
+
+# ── uninstall ────────────────────────────────────────────────────────────────
+
+def _service_unregister() -> tuple[bool, str | None]:
+    """Stop the supervisor and delete its registration.
+
+    Returns ``(ok, what was removed)``.  ``ok`` is False only when the service
+    is still standing: deleting the data directory under a running home is how
+    the stores get written back from memory after they are already gone.
+    """
+    kind = _service_kind()
+    if kind == "systemd-user":
+        if not UNIT_PATH.exists():
+            return True, None
+        # Two verbs here, and this is the only place that uses the first one.
+        # `stop` alone deliberately leaves autostart enabled (see cmd_stop);
+        # uninstall is the verb that means "do not come back", so it is also
+        # the one that clears the autostart symlink.  Both must succeed before
+        # the unit file goes, otherwise the supervisor is still watching a
+        # directory we are about to empty.
+        for verb in ("disable", "stop"):
+            r = _systemctl(verb, SERVICE_NAME)
+            if r is None or r.returncode != 0:
+                chatter = ((r.stderr or "") + (r.stdout or "")).strip() if r else ""
+                why = (chatter.splitlines()[-1] if chatter
+                       else f"systemctl exited {r.returncode}" if r
+                       else "systemctl is unavailable")
+                log_state("FAIL", f"cannot {verb} the service — {why}")
+                return False, None
+        UNIT_PATH.unlink(missing_ok=True)
+        _systemctl("daemon-reload")
+        return True, f"service unit removed: {UNIT_PATH}"
+    if kind == "service":
+        # pywin32 speaks SCM directly.  The old version shelled out to `sc.exe`
+        # and swallowed a missing binary as "nothing registered" — which made a
+        # refused deletion look like success.  Every failure below is real, and
+        # uninstall keeps the data when one of them happens.
+        return _win_service_unregister()
+    if kind == "launchd":
+        had_plist = UNIT_PATH.exists()
+        # bootout first: deleting a plist under a loaded job leaves launchd
+        # running a definition that is no longer on disk, and uninstall is about
+        # to empty the directory that job serves.
+        if had_plist:
+            if not _launchd_bootout():
+                return False, None
+            UNIT_PATH.unlink(missing_ok=True)
+        # `launchctl disable` writes a record into the GUI domain that outlives
+        # the plist (measured 11-07): a leftover "disabled" label is a mask the
+        # next `start` cannot bootstrap through, and its enable gate skips the
+        # repair precisely when the plist is gone.  Clearing the ledger belongs
+        # to removing the registration; it is a no-op when no record exists.
+        ledger_disabled = _autostart_state() is False
+        if ledger_disabled and not _launchd_set_enabled(True):
+            return False, None
+        notes = [f"service plist removed: {UNIT_PATH}"] if had_plist else []
+        if ledger_disabled:
+            notes.append("launchd disabled record cleared")
+        return True, "; ".join(notes) or None
+    return True, None
+
+
+def _uninstall_guard() -> str | None:
+    """Why deleting HA_ROOT must be refused, or None when it is safe.
+
+    Typing ``uninstall`` is the decision, so none of this asks a question.  The
+    checks exist for a *wrong* HA_ROOT — a bug, a hand-edited path, a symlink
+    planted where the data dir should be — and each one is cheaper than the
+    deletion it prevents.
+    """
+    if HA_ROOT.is_symlink():
+        return f"refusing to delete {HA_ROOT} — it is a symbolic link"
+    if not HA_ROOT.is_dir():
+        return f"refusing to delete {HA_ROOT} — it is not a directory"
+    resolved = HA_ROOT.resolve()
+    if resolved.name != ".homeant":
+        return (f"refusing to delete {resolved} — its last component is "
+                f"not '.homeant'")
+    for wrong in (Path.home().resolve(), PROJECT_ROOT.resolve(),
+                  Path(resolved.anchor)):
+        if resolved == wrong:
+            return f"refusing to delete {resolved} — that is {wrong}"
+    return None
+
+
+def _tree_size(path: Path) -> tuple[int, int]:
+    """(entry count, bytes) of a directory, counting links as links."""
+    files = 0
+    total = 0
+    for dirpath, _dirnames, filenames in os.walk(path, followlinks=False):
+        for name in filenames:
+            files += 1
+            try:
+                total += os.lstat(os.path.join(dirpath, name)).st_size
+            except OSError:
+                pass            # vanished mid-walk; the count is documentary
+    return files, total
+
+
+def _discard(path: Path) -> bool:
+    """Delete ``path`` outright: no trash, no prompt, no second copy.
+
+    Typing `uninstall` is the decision, and the expected outcome is a direct
+    delete (jiqia 21:4x).  The data directory is the only thing ever passed
+    here; the program tree is deliberately left in place.
+    """
+    try:
+        shutil.rmtree(path)
+    except OSError as e:
+        log_state("FAIL", f"cannot remove {path} — {e}")
+        return False
+    return not path.exists()
+
+
+def cmd_uninstall(args) -> int:
+    """Remove the service registration and the data dir.
+
+    Order is the whole safety story: the supervisor goes first (so nothing
+    restarts it), then any hass the supervisor never owned (so nothing flushes
+    its stores into a directory that is being emptied), and only then the files.
+    The source tree is never touched — it is where this script lives, and this
+    is a portable install.  Every file this project creates lives in HA_ROOT,
+    so removing that one directory is the whole cleanup.
+
+    There is no --keep-data and no prompt: typing this verb is the decision.
+    Keeping the data is what `stop` is for.  The delete is outright — no
+    Recycle Bin — and `status` / a second `uninstall` deliberately keep their
+    current behaviour (jiqia 21:4x).
+    """
+    ok, removed = _service_unregister()
+    if not ok:
+        return 1
+    notes = [removed] if removed else []
+
+    # One last process check after the service is gone: a hass started by hand
+    # (or by a build from before this tree was registered) is invisible to the
+    # supervisor but writes to HA_ROOT all the same.
+    pid = _ha_instance()
+    if pid:
+        if not _stop_pid(pid):
+            log_state("FAIL", f"hass (PID {pid}) is still running — it may be "
+                              f"flushing its stores; nothing was deleted")
+            return 1
+        notes.append(f"stopped hass (PID {pid})")
+
+    if not HA_ROOT.exists():
+        for note in notes:
+            log(note)
+        log("data already gone" if notes else "nothing to uninstall")
+        return 0
+
+    why = _uninstall_guard()
+    if why:
+        log_state("FAIL", why)
+        return 1
+
+    files, size = _tree_size(HA_ROOT)
+    # Printed before the deletion, and phrased as a record rather than a
+    # question: after it runs, this line is the only account of what was there.
+    log(f"removing {HA_ROOT} ({files} files, {size / 1e6:.1f} MB)")
+    if not _discard(HA_ROOT):
+        return 1
+    for note in notes:
+        log(note)
+    log("data removed")
     return 0
 
 
@@ -2157,6 +4481,30 @@ XIAOMI_FLOW_FILE = HA_ROOT / ".xiaomi-flow"
 XIAOMI_FLOW_TIMEOUT = 180
 
 
+def _xiaomi_flow_get(
+    flow_id: str, token: str, timeout: float = 10.0
+) -> tuple[int, dict | None]:
+    """One flow by id: (HTTP status, the flow when hass still knows it).
+
+    ``0`` means the request never got a usable answer — hass is not listening,
+    or what answered spoke something other than JSON.  The two callers need
+    that told apart differently (`start` rewrites the marker, `status` only
+    reports), so this returns the status instead of a bare None and never
+    touches the marker itself.
+    """
+    try:
+        status, flow = _http_get(
+            f"http://localhost:{PORT}/api/config/config_entries/flow/{flow_id}",
+            headers={"Authorization": f"Bearer {token}"},
+            timeout=timeout,
+        )
+    except (OSError, ValueError):
+        return 0, None
+    if status != 200 or not isinstance(flow, dict) or "flow_id" not in flow:
+        return status, None
+    return status, flow
+
+
 def _xiaomi_live_flow(token: str) -> dict | None:
     """The flow a previous run left behind, if this hass still knows about it.
 
@@ -2175,14 +4523,47 @@ def _xiaomi_live_flow(token: str) -> dict | None:
         return None
     if not flow_id:
         return None
-    status, flow = _http_get(
-        f"http://localhost:{PORT}/api/config/config_entries/flow/{flow_id}",
-        headers={"Authorization": f"Bearer {token}"},
-    )
-    if status != 200 or not isinstance(flow, dict) or "flow_id" not in flow:
+    _, flow = _xiaomi_flow_get(flow_id, token)
+    if flow is None:
+        # Unreachable hass (status 0) lands here too: an id that cannot be
+        # resolved is spent either way, and the next run starts a fresh flow.
         XIAOMI_FLOW_FILE.unlink(missing_ok=True)
         return None
     return flow
+
+
+def _xiaomi_flow_state() -> str:
+    """Where the flow in ``.xiaomi-flow`` is parked — read-only, best effort.
+
+    ``"authorizing"`` — still on the OAuth step, the browser has not come back.
+    ``"advancing"`` — the callback landed and hass moved the flow on to the
+    ``homes_select`` form by itself, so only `start` answering it is missing.
+    ``"lost"`` — hass does not know the id (restarted since), which makes the
+    login page the user may still have open a dead end.
+    ``"unknown"`` — no cached token, hass not listening, or a refusal: the
+    caller falls back to the wording that covers both halves.
+
+    The cached LLAT is used as-is — no login, no mint, no `_token_ok` probe —
+    because a stale token only costs one 401 and the fallback line.  The short
+    timeout keeps `status` from hanging on a wedged instance; the endpoint is a
+    memory lookup, so a healthy one answers instantly.
+    """
+    try:
+        flow_id = XIAOMI_FLOW_FILE.read_text(encoding="utf-8").strip()
+        token = MCP_TOKEN_FILE.read_text(encoding="utf-8").strip()
+    except OSError:
+        return "unknown"
+    if not flow_id or not token:
+        return "unknown"
+    status, flow = _xiaomi_flow_get(flow_id, token, timeout=3)
+    if status == 404:
+        return "lost"
+    if flow is None:
+        return "unknown"
+    step = flow.get("step_id")
+    if step == "oauth":
+        return "authorizing"
+    return "advancing" if step else "unknown"
 
 
 def _oauth_pending_url(flow: dict) -> str | None:
@@ -2650,7 +5031,7 @@ def _ensure_auth_offline() -> bool:
     # about our pid, while a busy port only means *somebody* holds 8123 (a
     # dllhost.exe squatting there once made this line blame hass, which sent
     # the reader after a process that was never started).
-    if _ha_instance():
+    if _ha_instance() or _hass_via_service():
         log("auth provision skipped: hass is running")
         return False
     if port_in_use(PORT):
@@ -3234,22 +5615,56 @@ Typical workflow:
         "--no-install", action="store_true",
         help="Do not check for a release or hand back to the installer "
              "(set by the installer for its own final start)")
+    # The supervisor contract, not a user-facing mode: the service unit's
+    # ExecStart is `start --foreground`.  Named for what it does to this
+    # process (stays attached) rather than for its caller, because docker and
+    # a terminal are just two more supervisors.
+    p_start.add_argument(
+        "--foreground", action="store_true",
+        help="Run in the foreground and do not detach; used by the service "
+             "manager and for debugging")
+    # The Windows SCM entry point.  Not a user-facing mode either: it is what
+    # the service registration's ImagePath runs, and its only job is the
+    # StartServiceCtrlDispatcher handshake the SCM insists on — the work stays
+    # in `--foreground`, spawned one layer down.  Both switches, never values,
+    # for the same reason as --no-install.
+    p_start.add_argument(
+        "--service-host", action="store_true",
+        help="Windows only: act as the service control manager's host process "
+             "(set by the service registration)")
     p_start.set_defaults(func=cmd_start)
 
     for name, help_text, func in [
         ("status", "Health check + hass status", cmd_status),
         ("stop", "Stop hass", cmd_stop),
+        ("disable", "Turn off start at boot; the running home keeps running "
+                    "(start turns it back on)", cmd_disable),
         ("logs", "Stream hass logs", cmd_logs),
     ]:
         p = sub.add_parser(name, help=help_text)
         p.set_defaults(func=func)
+
+    p_uninstall = sub.add_parser(
+        "uninstall", help="Remove the service registration and the data directory")
+    # No prompt, no --yes and no --keep-data: typing the verb *is* the decision
+    # (decided 11-04, narrowed 11-05).  The guard rails refuse automatically
+    # instead of asking, so a wrong HA_ROOT gets an explanation rather than a
+    # yes/no question nobody has the information to answer.  Keeping the data
+    # is what `stop` does; a partial uninstall is a state nobody can name.
+    p_uninstall.set_defaults(func=cmd_uninstall)
 
     args = parser.parse_args()
 
     # `start` reads homeant.cfg (USERNAME/PASSWORD/XIAOMI_*).  Everything
     # else (stop/status/logs) only touches PID file, HA_ROOT, or subprocess
     # control.
-    if args.command == "start":
+    #
+    # `--foreground` and `--service-host` are excluded: both are the supervised
+    # child, they read no cfg, and a process the service manager restarts must
+    # not be the one writing to the source tree.  The orchestrated `start` has
+    # already reconciled it.
+    if args.command == "start" and not (getattr(args, "foreground", False)
+                                        or getattr(args, "service_host", False)):
         # `start` owns the live config: it is what a fresh install runs and what
         # an upgrade ends with, so it creates the file from the template and
         # appends keys a newer version added. Doing it here, before load_cfg(),

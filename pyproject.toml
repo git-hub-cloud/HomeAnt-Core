@@ -1,10 +1,18 @@
 [project]
 name = "homeant"
-version = "0.1.0"
+version = "0.1.1"
 description = "Home Control by Agent — Control smart-home devices through AI agents"
 readme = "README.md"
 license = { text = "MIT" }
-requires-python = ">=3.14.2"
+# The one and only place the interpreter version is decided.  The lower bound is
+# HA's own (core/pyproject.toml).  The upper bound is ours: 3.15 has no wheels
+# for a good part of this dependency set, so uv would build grpcio & friends
+# from source and a 20-second sync becomes a ten-minute one that reads as a hang
+# (measured 11-06 on macOS 15.7 arm64: 3.14.8 = 20.5s and zero compiler runs).
+# uv enforces this against every override — a stray UV_PYTHON, a --python flag
+# or a stale .python-version now fails loudly instead of silently installing the
+# wrong interpreter, which is why neither installer carries a version any more.
+requires-python = ">=3.14.2,<3.15"
 dependencies = [
     "homeassistant==2026.10.1",
     # mcp_server's own requirements, mirrored here so `uv sync` installs them

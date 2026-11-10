@@ -45,10 +45,73 @@ _fatal() { err "$1"; exit 1; }
 # failure - a green install and a service that cannot bind.
 PREFLIGHT_PORTS="8123|Home Assistant HTTP"
 
-# How long the stop below waits for hass to exit before SIGKILL.  The same
+# How long the stop below waits for the service to actually be gone.  The same
 # number is $HassStopWaitSec in install.ps1: the two installers stop the same
 # instance and must not disagree about when "still alive" starts being true.
 HASS_STOP_WAIT_SEC=20
+
+# The user unit this installer is allowed to stop, plus a runner for it.
+#
+# $HOME/.config/systemd/user and nothing else: systemd does not consult
+# XDG_CONFIG_HOME for user units, and homeant.py writes the unit to this exact
+# path - honouring the variable here would only invent a file systemd never
+# reads.
+#
+# `systemctl --user` needs a session bus, and a non-login shell has no
+# XDG_RUNTIME_DIR - ssh, cron and `curl | sh` all land there, and systemctl
+# answers "Failed to connect to bus: No such file or directory".  homeant.py
+# repairs the same gap before its own calls; this is that repair, one line of it.
+USER_UNIT_FILE="${HOME:-}/.config/systemd/user/homeant.service"
+
+# macOS keeps the same idea in a different file, addressed by *label* in the gui
+# domain.  Both names are hardcoded instead of being probed out of homeant.py:
+# this script runs before that Python is usable, and a mismatch would show up as
+# "nothing of ours is running" right up to the moment uv sync replaces a live
+# venv.  They must stay in step with LAUNCHD_LABEL / UNIT_PATH in homeant.py.
+LAUNCHD_LABEL="cn.homeant"
+LAUNCHD_PLIST="${HOME:-}/Library/LaunchAgents/${LAUNCHD_LABEL}.service.plist"
+
+_is_mac() { [ "$(uname -s)" = "Darwin" ]; }
+
+_userctl() {
+    if [ -z "${XDG_RUNTIME_DIR:-}" ] && [ -d "/run/user/$(id -u)" ]; then
+        XDG_RUNTIME_DIR="/run/user/$(id -u)"
+        export XDG_RUNTIME_DIR
+    fi
+    systemctl --user "$@"
+}
+
+# Is the LaunchAgent loaded?  `launchctl print` is the cheap query, and it
+# exits non-zero for a label that was never bootstrapped.  Loaded rather than
+# "running" on purpose: this answers "is something of ours holding the port",
+# and a job that crash-looped holds nothing either way.
+_launchd_loaded() {
+    [ -f "$LAUNCHD_PLIST" ] && command -v launchctl >/dev/null 2>&1 &&
+        launchctl print "gui/$(id -u)/$LAUNCHD_LABEL" >/dev/null 2>&1
+}
+
+# One stop verb, two supervisors: systemd wants `stop`, launchd wants `bootout`
+# (`unload` is deprecated and `stop` does not exist there).
+_stop_service() {
+    if _is_mac; then
+        launchctl bootout "gui/$(id -u)/$LAUNCHD_LABEL"
+    else
+        _userctl stop homeant
+    fi
+}
+
+# Is *our* service the one holding the port / the tree?  One question with one
+# answer: since T5 the unit is the only thing that starts hass on this box, so a
+# hass-shaped process is either that unit's child or a debug `start --foreground`.
+# Returns 1 - never aborts, `set -e` is on - unless the answer is a confident yes.
+_service_active() {
+    if _is_mac; then
+        _launchd_loaded
+        return
+    fi
+    [ -f "$USER_UNIT_FILE" ] && command -v systemctl >/dev/null 2>&1 &&
+        _userctl is-active --quiet homeant 2>/dev/null
+}
 
 # Does a listening-socket table on stdin mention port $1?  Matched against the
 # whole line rather than a fixed column: BSD netstat puts the local address in
@@ -62,8 +125,8 @@ _pf_table_has() {
 # Linux procfs: is anything LISTENing on $port?  No external tool at all -
 # /proc/net/tcp{,6} is a kernel file any user can read.  Column 2 is
 # "addr:port" in hex, column 4 is the state, 0A = LISTEN.  procfs carries no
-# owner pid, so a hit reports "unknown"; the caller then falls back to
-# find_hass_pid, exactly as ss/netstat without root would.
+# owner pid, so a hit reports "unknown" - and that is all this check needs:
+# *whose* listener it is gets answered by the service manager, never by a pid.
 _pf_proc_listening() {
     local hex f
     hex=$(printf '%04X' "$1")
@@ -80,11 +143,11 @@ _pf_proc_listening() {
     return 0
 }
 
-# Pids listening on $1, one per line.  Empty output = nothing listening.
-# "unknown" = listening, but this box has no way to name the owner (procfs has
-# no pid, and netstat -p needs root); the caller then falls back to "is our own
-# HA alive".  Returns 3 when no listener source exists at all - a skipped check
-# is honest, a guess is not.
+# Anything listening on $1?  Empty output = free.  Non-empty = taken - either
+# "unknown" (procfs / netstat, no owner) or a pid list (lsof); the caller only
+# asks whether the output is empty, because ownership is the service manager's
+# question, not a pid's.  Returns 3 when no listener source exists at all - a
+# skipped check is honest, a guess is not.
 #
 # Linux answers from procfs, so the common case needs no lsof/ss/netstat at all
 # (those are optional packages on many minimal spins - exactly the hosts this
@@ -109,110 +172,9 @@ _pf_listeners() {
     return 3
 }
 
-# Is $1 a hass that this project owns?  Image name narrows the search - the
-# verdict comes from the command line carrying "--config" *and* this exact
-# HA_ROOT, the same pair homeant uses to call a process its own.  `ps`
-# rather than /proc so macOS can answer too.
-_pf_is_our_hass() {
-    local img cmd root="${HOME:-}/.homeant"
-    img=$(ps -o comm= -p "$1" 2>/dev/null) || return 1
-    case "$img" in
-        *python*|*hass*) ;;
-        *) return 1 ;;
-    esac
-    cmd=$(ps -o command= -p "$1" 2>/dev/null) || return 1
-    case "$cmd" in
-        *--config*) ;;
-        *) return 1 ;;
-    esac
-    case "$cmd" in
-        *"$root"*) return 0 ;;
-    esac
-    return 1
-}
-
-# The hass pid this install owns, or empty.  Shared verdict for preflight and
-# for the stop below: one implementation, two readers.
-#
-# One record: HA's own HA_ROOT/.ha_run.lock ({"pid": N, ...}).  homeant no
-# longer keeps a pid file of its own, so this is the same record its own `stop`
-# reads - one authority, and no second copy left to disagree with it.  The ~8s
-# a fresh hass needs before HA writes that lock is out of reach here: this
-# script runs after a full unzip, and an instance interrupted mid-boot has
-# already been killed by homeant's atexit cleanup.
-#
-# The lock lives inside HA_ROOT (~/.homeant), a directory no other tool ever
-# runs HA against, so a pid found there is ours - provided the number still
-# points at a hass-shaped process.  HA writes the file but never deletes it, so
-# the number inside is only a claim: kill -0 answers "is *some* process holding
-# this number", not "is it ours", and the stop takes the whole process group, so
-# a recycled pid could take down an unrelated shell.  The kernel's name for the
-# pid (/proc/<pid>/comm) is the cheap second opinion.
-#
-# A normal install reaches this with no lock file at all: HA has never run in
-# this HA_ROOT, so only the processes can answer.  The image name only narrows
-# the search - the verdict comes from the command line carrying "--config"
-# *and* this exact HA_ROOT.  Killing on the name alone would take out any
-# python script the user happens to be running, which is not a trade this
-# script gets to make.
-find_hass_pid() {
-    local lock pid img dir cand cmd root
-    pid=""
-    lock="${HOME:-}/.homeant/.ha_run.lock"
-    if [ -n "${HOME:-}" ] && [ -f "$lock" ]; then
-        root="${HOME}/.homeant"
-        pid=$(sed -n 's/.*"pid"[[:space:]]*:[[:space:]]*\([0-9]\{1,\}\).*/\1/p' \
-            "$lock" 2>/dev/null | head -1) || pid=""
-        if [ -z "$pid" ] || ! kill -0 "$pid" 2>/dev/null; then
-            pid=""
-        else
-            # The command line has to answer, exactly as it does in the scan
-            # below and in homeant's _cmdline_is_hass.  comm only narrows:
-            # it says "some python", and the stop below is a group kill, so a
-            # recycled pid would take an unrelated shell with it.  Unreadable
-            # cmdline (permissions, a dying process) falls through to the scan
-            # rather than being trusted.
-            cmd=$(tr '\0' ' ' <"/proc/$pid/cmdline" 2>/dev/null) || cmd=""
-            case "$cmd" in
-                *--config*) ;;
-                *) pid="" ;;
-            esac
-            case "$cmd" in
-                *"$root"*) ;;
-                *) pid="" ;;
-            esac
-        fi
-    fi
-    if [ -z "$pid" ] && [ -n "${HOME:-}" ] && [ -d /proc ]; then
-        root="${HOME}/.homeant"
-        for dir in /proc/[0-9]*; do
-            cand="${dir#/proc/}"
-            if [ "$cand" = "$$" ]; then
-                continue
-            fi
-            img=$(cat "$dir/comm" 2>/dev/null) || continue
-            case "$img" in
-                python*|*hass*) ;;
-                *) continue ;;
-            esac
-            cmd=$(tr '\0' ' ' <"$dir/cmdline" 2>/dev/null) || continue
-            case "$cmd" in
-                *--config*) ;;
-                *) continue ;;
-            esac
-            case "$cmd" in
-                *"$root"*)
-                    pid="$cand"
-                    break
-                    ;;
-            esac
-        done
-    fi
-    printf '%s' "$pid"
-}
 
 preflight() {
-    local entry port label out rc pid foreign ours _pf_ifs
+    local entry port label out rc _pf_ifs
     # One entry per line, so a label may contain spaces.  Split on IFS in a
     # `for` rather than in a `while read` pipeline: a pipeline runs the loop in
     # a subshell, where _fatal would exit only that subshell and preflight
@@ -236,30 +198,22 @@ preflight() {
         if [ -z "$out" ]; then
             continue
         fi
-        if [ "$out" = "unknown" ]; then
-            # procfs/netstat without an owner pid: the port is taken, the name
-            # is hidden.  Our own HA being alive is the only acceptable
-            # explanation left.
-            ours=$(find_hass_pid)
-            if [ -n "$ours" ]; then
-                info "preflight: port $port (PID $ours) - will be stopped before uv sync"
-                continue
-            fi
-            _fatal "port $port ($label) is already in use and this installer cannot tell by which process - stop it and re-run. HomeAnt will not take a port it does not own."
+        # Something is listening, and the only listener this installer may take
+        # down is its own service.  Ask the service manager instead of guessing
+        # from a pid: `is-active` is one question with one answer, and since T5
+        # the unit is the only thing that starts hass on this box.
+        #
+        # A bare `start --foreground` instance therefore lands in the reject
+        # branch, on purpose: that form is for debugging, and killing a process
+        # because it *looks* like hass is a trade this script does not get to
+        # make.  On Windows the same question is `Get-Service -Name homeant`
+        # (see install.ps1), never sc.exe: its output is localised and T9 needs
+        # a state word, not a translated sentence.
+        if _service_active; then
+            info "preflight: port $port ($label) held by the homeant service - will be stopped before uv sync"
+            continue
         fi
-        foreign=""
-        for pid in $out; do
-            if ! _pf_is_our_hass "$pid"; then
-                foreign="$pid"
-            fi
-        done
-        if [ -n "$foreign" ]; then
-            _fatal "port $port ($label) is already in use by PID $foreign ($(ps -o comm= -p "$foreign" 2>/dev/null || echo unknown)) - stop it and re-run. HomeAnt will not take a port it does not own."
-        fi
-        # Every listener here is ours - a foreign one fataled just above - so the
-        # first pid names the instance, same shape as the unknown-owner branch.
-        for pid in $out; do break; done
-        info "preflight: port $port (PID $pid) - will be stopped before uv sync"
+        _fatal "port $port ($label) is already in use by something this install does not manage - stop it and re-run. HomeAnt will not take a port it does not own."
     done
     IFS=$_pf_ifs
 
@@ -556,36 +510,39 @@ fi
 # ============================================================
 # uv sync + homeant start
 # ============================================================
-# Stop a running Home Assistant - re-install must not race with a live process
-# (the venv holds .venv/Scripts/hass.exe open, uv sync cannot replace it).
+# Stop our Home Assistant - re-install must not race with a live process
+# (uv sync cannot replace files the running instance holds open).
 #
-# *Which* pid that is comes from find_hass_pid() at the top of this file: the
-# same verdict preflight uses to decide whether the process sitting on 8123 is
-# ours.  Shared judgement, separate kill - `./homeant stop` would run on
-# the very venv `uv sync` is about to replace (mid-upgrade), or on nothing at
-# all (fresh install), so the one step that must not fail here stays free of
-# Python entirely.
+# The unit is the whole job now: since T5 it is the only thing that starts hass
+# on this box, so one `systemctl --user stop` replaces the old pid hunt and its
+# group kill.  Deliberately `stop` and not `disable` - an upgrade must not change
+# whether this service comes back after a reboot, and `start` at the bottom
+# re-enables it anyway.
 #
-# The group kill (`-$pid`) is not decoration: start creates the session with
-# start_new_session=True, so the pid is also the process-group id, and hass'
-# workers live in that group. Plain `kill $pid` would leave them holding the
-# venv.
-_hass_pid=$(find_hass_pid)
-
-if [ -n "$_hass_pid" ]; then
-    info "Home Assistant running (PID $_hass_pid) - stopping before uv sync"
-    kill -TERM "-$_hass_pid" 2>/dev/null || kill -TERM "$_hass_pid" 2>/dev/null || true
-    # wait for it to really be gone: uv sync needs the file handles released,
-    # and a half-dead hass still holds the recorder database
-    _wait=0
-    while kill -0 "$_hass_pid" 2>/dev/null && [ "$_wait" -lt "$HASS_STOP_WAIT_SEC" ]; do
-        sleep 1
-        _wait=$((_wait + 1))
-    done
-    if kill -0 "$_hass_pid" 2>/dev/null; then
-        info "PID $_hass_pid still alive after ${HASS_STOP_WAIT_SEC}s - killing again"
-        kill -KILL "-$_hass_pid" 2>/dev/null || kill -KILL "$_hass_pid" 2>/dev/null || true
-        sleep 1
+# Not `./homeant stop` either: that would run on the very venv `uv sync` is about
+# to replace (mid-upgrade), or on nothing at all (fresh install).  The one step
+# that must not fail here stays free of Python.
+#
+# No unit / not active = nothing of ours is running.  A bare `start --foreground`
+# instance never reaches this point: preflight refused it earlier rather than
+# kill a process on its looks.
+if _service_active; then
+    info "homeant service is running - stopping it before uv sync"
+    if _stop_service; then
+        # `systemctl stop` is synchronous, so this is a cheap confirmation for a
+        # unit the manager had to SIGKILL (KillMode=mixed) rather than a wait.
+        _wait=0
+        while _service_active && [ "$_wait" -lt "$HASS_STOP_WAIT_SEC" ]; do
+            sleep 1
+            _wait=$((_wait + 1))
+        done
+        if _service_active; then
+            info "service still active after ${HASS_STOP_WAIT_SEC}s - uv sync may fail"
+        else
+            info "service stopped"
+        fi
+    else
+        info "could not stop the homeant service - uv sync may fail"
     fi
 fi
 
@@ -594,12 +551,20 @@ fi
 # Those are not in uv.lock, so the default exact sync deletes them and the
 # next boot spends ~30s putting 288 MB back. Versions covered by the lock
 # are still aligned exactly - only extraneous packages are left alone.
+# No --python here, on purpose.  The interpreter is pinned in exactly one place
+# - requires-python in pyproject.toml, ">=3.14.2,<3.15" - and uv enforces it on
+# every entry point: a mismatching UV_PYTHON, a --python flag or a stale
+# .python-version is a hard error, never a silent build from source.  A version
+# literal repeated here could only drift out of step with that one source.
 info "uv sync ..."
 "$uv_bin" sync --inexact --link-mode=copy || { _fatal "uv sync FAILED"; }
 info "dependencies installed"
 
-# a zip built on Windows drops the +x bit
-chmod +x ./homeant 2>/dev/null || true
+# A zip built on Windows drops the +x bit.  Not best-effort on purpose: a tree
+# whose entry point cannot run is a failed install wearing a success message,
+# and the user would only find out on the next command.  chmod's own stderr is
+# left visible for the same reason.
+chmod +x ./homeant || _fatal "cannot set +x on ./homeant"
 
 # ============================================================
 # replace the integrations this release ships
@@ -642,7 +607,9 @@ info "homeant start ..."
 # SUCCESS / PENDING / FAIL line — the three-way distinction is for the reader —
 # and folds SUCCESS and PENDING into the same code, so there is no state
 # vocabulary to keep in sync between the two files. A step left for a human is
-# not an install failure: the files are in place and the service is up, and
-# re-running is the retry. Reporting it as FAILED is how a good install gets
-# reinstalled in a loop that cannot end differently.
-./homeant start --no-install || _fatal "FAILED"
+# not an install failure: the files are in place, the missing piece is on the
+# line above, and re-running `homeant start` is the retry. Reporting it as
+# FAILED is how a good install gets reinstalled in a loop that cannot end
+# differently — so say what is actually wrong and what to do, and keep rc=1 for
+# the automation that only reads the exit code.
+./homeant start --no-install || _fatal "start did not finish - fix the line above, then re-run: ./homeant start"

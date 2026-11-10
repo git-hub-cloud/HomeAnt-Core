@@ -333,15 +333,28 @@ def check_drift(repo_root: Path, version: str) -> list[str]:
                     f"{label}: finishes with `homeant start "
                     f"{m.group(1).strip()}` — the only flag is --no-install")
 
-    # 4. the py side of that contract: `start` is the single entry point, so it
-    #    registers exactly one flag and it is a store_true --no-install. A value
-    #    flag would arrive as the string "false" — true in Python — and the loop
-    #    breaker would silently do nothing. `init` must not come back either:
-    #    setup happens inside `start`, so a second entry point would drift.
-    if py.count("p_start.add_argument(") != 1:
+    # 4. the py side of that contract: `start` is the single entry point, so the
+    #    only flags it may register are the two store_true switches its callers
+    #    set. A value flag would arrive as the string "false" — true in Python —
+    #    and the switch would silently do nothing. `init` must not come back
+    #    either: setup happens inside `start`, so a second entry point would
+    #    drift.
+    #
+    #    `--foreground` joined in T5 as the supervisor contract (the unit's
+    #    ExecStart, and the docker/terminal case) and `--service-host` in T9 as
+    #    the Windows SCM entry point; before that this check said "exactly one
+    #    flag".  All three are switches, never values — the list pins the kind
+    #    as well as the names, so a fourth flag has to be argued for here
+    #    instead of slipping in.
+    start_flags = re.findall(
+        r"p_start\.add_argument\(\s*\"(--[a-z-]+)\"\s*,\s*action=\"store_true\"",
+        py,
+    )
+    if sorted(start_flags) != ["--foreground", "--no-install", "--service-host"]:
         problems.append(
-            "homeant.py: `start` must register exactly one flag "
-            "(--no-install)"
+            "homeant.py: `start` registers exactly three store_true switches — "
+            f"--no-install, --foreground and --service-host "
+            f"(found: {start_flags or 'none'})"
         )
     m = re.search(r"p_start\.add_argument\((.*?)\n\s*p_start\.set_defaults", py, re.S)
     body = m.group(1) if m else ""
