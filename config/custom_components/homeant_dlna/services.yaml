@@ -1,0 +1,57 @@
+play:
+  name: Play audio on the default DLNA speaker
+  description: >-
+    Queue audio on the default DLNA speaker. Accepts an http(s) URL, a local
+    audio file path, or a directory. A path may carry several sources
+    separated by '|' or newlines: each one is expanded and appended in the
+    order given, so one call queues a whole playlist (parts that resolve to
+    nothing are dropped). Each call rebuilds the queue and starts from its
+    first track (it does not append): a single source is a one-track queue, a
+    directory expands to all its tracks. Playback advances automatically and
+    stops after the last track. Only audio URLs belong here: hand a web page
+    (search, playlist, player, any HTML) to a renderer and it gets markup back
+    — the call still returns ok, but nothing plays and nothing errors. When
+    given a page URL, resolve the audio link behind it first (its API, or an
+    audio/m3u8 source in the markup) and queue that direct link; if none is
+    found, say so instead of queueing the page.
+  fields:
+    path:
+      name: Audio source
+      description: >-
+        http(s) URL pointing at the audio stream itself (not a web page —
+        resolve the page to its audio link first), absolute path to an audio
+        file, or a directory containing audio files. Several sources may be
+        given, separated by '|' or newlines, to queue them in order. Empty
+        uses the configured default_dirs.
+      required: false
+      selector:
+        text:
+    mode:
+      name: Directory ordering
+      description: How to order tracks when path is a directory.
+      required: false
+      default: sequential
+      selector:
+        select:
+          options:
+            - sequential
+            - random
+    speaker:
+      name: Speaker
+      description: Target media_player entity. Empty uses the default speaker.
+      required: false
+      example: media_player.xiao_ai_yin_xiang_3294
+      selector:
+        entity:
+          domain: media_player
+
+resume:
+  name: Resume a stopped DLNA queue
+  description: >-
+    Continue a queue that was stopped by HA or the speaker. Seeks back to the
+    saved pause point (or replays from the head if unavailable). Expires after
+    the queue's idle TTL.
+
+cancel:
+  name: Stop and clear the DLNA queue
+  description: Stop playback and drop the in-memory queue. No resume after this.

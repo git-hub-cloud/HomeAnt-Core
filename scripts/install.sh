@@ -11,8 +11,26 @@ set -eu
 
 HOMEANT_VERSION="__HOMEANT_VERSION_PLACEHOLDER__"
 HOMEANT_SERVER="${HOMEANT_SERVER:-dl.homeant.cn}"
-ZIP_URL="https://${HOMEANT_SERVER}/core/HomeAnt-${HOMEANT_VERSION}.zip"
-UV_INSTALL_URL="https://${HOMEANT_SERVER}/uv/0.12.23/uvinstall.sh"
+# sha256 of the release zip, computed and stamped in here by dist-pack.py at
+# pack time.  It travels inside this script rather than being fetched beside the
+# zip: no second request, and a stale CDN entry cannot serve back a digest that
+# matches the stale zip it handed out with it.  Unstamped - running this file
+# straight out of the source tree - the literal stays a placeholder and
+# verify_zip_digest() reports "could not check", never a match.
+HOMEANT_ZIP_SHA256="__HOMEANT_ZIP_SHA256_PLACEHOLDER__"
+# The first 8 hex of that digest, taken from the stamped value itself rather
+# than stamped a second time: two numbers that can disagree is exactly how one
+# platform ends up fetching a name the host never has.  It is an identifier,
+# never a check - the bytes are compared against the full 64 hex above, so the
+# short form can be wrong in the URL and the download still stops on mismatch.
+ZIP_TAG=$(printf '%s' "$HOMEANT_ZIP_SHA256" | cut -c1-8)
+ZIP_URL="https://${HOMEANT_SERVER}/core/HomeAnt-${HOMEANT_VERSION}-${ZIP_TAG}.zip"
+# uv release bootstrapped by this installer. Bump this one line: the URL below
+# and the matching CDN directory (uv/<version>/, uploaded separately - it never
+# goes into the zip) both derive from it. Keep it equal to the "uv==" pin in
+# pyproject.toml.
+UV_VERSION="0.13.6"
+UV_INSTALL_URL="https://${HOMEANT_SERVER}/uv/${UV_VERSION}/uvinstall.sh"
 CONNECT_TIMEOUT=15
 TRANSFER_TIMEOUT=600
 
@@ -32,18 +50,44 @@ err()  { printf '%s[install]%s %s\n' "$_c_red" "$_c_off" "$*" >&2; }
 # was a Windows double-click idiom. Errors go to stderr and stay visible.
 _fatal() { err "$1"; exit 1; }
 
+# Display form of a path: ~/rest when it sits under $HOME, unchanged otherwise.
+# The same rule homeant.py follows (_home_tilde) and the same spelling install.ps1
+# prints, so every line the user reads - whichever platform, whichever command -
+# names their own tree the one way they type it.  Display only: the commands in
+# these messages keep absolute paths, which are the ones that work wherever the
+# tree happens to sit.
+_tilde() {
+    _th=${HOME:-}
+    _th=${_th%/}
+    if [ -z "$_th" ]; then
+        printf '%s' "$1"
+        return
+    fi
+    case "$1" in
+        "$_th") printf '~' ;;
+        "$_th"/*) printf '~/%s' "${1#"$_th"/}" ;;
+        *) printf '%s' "$1" ;;
+    esac
+}
+
 # ============================================================
 # preflight - refuse BEFORE anything is downloaded or overwritten
 # ============================================================
-# One entry per requirement, "<port>|<label>".  The MQTT broker this project
-# will grow is one more entry here plus one more in install.ps1's
-# $PreflightPorts - the two lists are meant to be the same list.
+# One entry per requirement, "<port>|<label>", one per LINE: preflight() splits
+# on a literal newline so a label may contain spaces.  Both ports belong to the
+# same service: hass listens on 8123, the broker on 1883, and the
+# broker is a child of the supervised process, so stopping the service frees
+# both.  Keep this list equal to install.ps1's $PreflightPorts - check_drift()
+# in dist-pack.py compares the two port sets before a release is packed.
 #
-# The rule for every port is the same: free is fine, our own Home Assistant is
-# fine (the install stops it further down), anybody else is a hard stop.  An
-# installer that walks past a port it does not own produces the worst kind of
-# failure - a green install and a service that cannot bind.
-PREFLIGHT_PORTS="8123|Home Assistant HTTP"
+# The rule for every port is the same: free is fine, our own service is fine
+# (the install stops it further down), anybody else is a hard stop.  On Linux
+# procfs names no owner, so "ours" is answered by the service manager, never
+# guessed from a pid: a running homeant unit is the only listener this script
+# may take down.  An installer that walks past a port it does not own produces
+# the worst kind of failure - a green install and a service that cannot bind.
+PREFLIGHT_PORTS="8123|Home Assistant HTTP
+1883|HomeAnt MQTT"
 
 # How long the stop below waits for the service to actually be gone.  The same
 # number is $HassStopWaitSec in install.ps1: the two installers stop the same
@@ -101,7 +145,7 @@ _stop_service() {
 }
 
 # Is *our* service the one holding the port / the tree?  One question with one
-# answer: since T5 the unit is the only thing that starts hass on this box, so a
+# answer: the unit is the only thing that starts hass on this box, so a
 # hass-shaped process is either that unit's child or a debug `start --foreground`.
 # Returns 1 - never aborts, `set -e` is on - unless the answer is a confident yes.
 _service_active() {
@@ -200,14 +244,16 @@ preflight() {
         fi
         # Something is listening, and the only listener this installer may take
         # down is its own service.  Ask the service manager instead of guessing
-        # from a pid: `is-active` is one question with one answer, and since T5
-        # the unit is the only thing that starts hass on this box.
+        # from a pid: `is-active` is one question with one answer, and
+        # the unit is the only thing that starts hass on this box.  1883 is
+        # covered by the same answer: the broker is in that unit's process tree,
+        # so a running unit means this listener goes away with it.
         #
         # A bare `start --foreground` instance therefore lands in the reject
         # branch, on purpose: that form is for debugging, and killing a process
         # because it *looks* like hass is a trade this script does not get to
         # make.  On Windows the same question is `Get-Service -Name homeant`
-        # (see install.ps1), never sc.exe: its output is localised and T9 needs
+        # (see install.ps1), never sc.exe: its output is localised and we need
         # a state word, not a translated sentence.
         if _service_active; then
             info "preflight: port $port ($label) held by the homeant service - will be stopped before uv sync"
@@ -218,8 +264,8 @@ preflight() {
     IFS=$_pf_ifs
 
     # ── program checks (reserved) ───────────────────────────────────────────
-    # Non-port requirements belong here: the MQTT broker binary a later release
-    # ships, a kernel/OS feature HA needs, a minimum free-space budget.  Same
+    # Non-port requirements belong here: a new broker binary shipped in the zip,
+    # a kernel/OS feature HA needs, a minimum free-space budget.  Same
     # contract as the port loop above - say what is wrong and _fatal, never
     # warn-and-continue.  Nothing is added here until it has a real failure
     # mode to catch.
@@ -229,15 +275,114 @@ preflight() {
     # read-only or root-owned target fails thousands of writes into the unzip
     # and surfaces as the extractor's own "Permission denied" - a message that
     # names neither the directory nor the fix.  One stat here replaces that.
-    [ -w "$_here" ] || _fatal "install directory is not writable: $_here - change to a directory you own (e.g. cd ~) and re-run"
+    [ -w "$_here" ] || _fatal "install directory is not writable: $(_tilde "$_here") - change to a directory you own (e.g. cd ~) and re-run"
 }
+
+# ============================================================
+# replace the integrations this tree ships
+# ============================================================
+# ~/.homeant/custom_components is written by `homeant start`, and start only
+# fills gaps: a missing target is copied, an existing one is merged - and a
+# merge cannot rewrite a .py (only yaml/json have merge semantics).  A fixed
+# integration would therefore never reach a deployment that already had one.
+#
+# Two callers, one rule: the published install (bottom of this file) and
+# `--upgrade` inside a source tree.  Both end in `homeant start`, so both need
+# the same "remove what this tree ships, then let start copy it in" step - and
+# both must remove exactly the same set, which is why the scan lives here once
+# instead of being written twice and drifting.
+#
+# Deleting rather than copying over is deliberate: copying into an existing
+# directory leaves behind files the tree no longer ships, and HA keeps
+# importing them.  Only domains named by the two shipped sources are removed -
+# a component the user added by hand is not in that list and stays put.
+#
+# $1 is the tree to read the domain names from; the target is always
+# $HOME/.homeant/custom_components (HA_ROOT is fixed there).
+_replace_shipped_components() {
+    [ -n "${HOME:-}" ] && [ -d "${HOME}/.homeant/custom_components" ] || return 0
+    # Drop the seed marker too: it is the other thing `start` consults before
+    # deciding that its deploy already ran.
+    rm -f "${HOME}/.homeant/.seed-state"
+    for _sc_dir in "$1"/config/custom_components/*/ \
+                  "$1"/vendor/ha_xiaomi_home/custom_components/*/; do
+        [ -d "$_sc_dir" ] || continue
+        _sc_domain="$(basename "$_sc_dir")"
+        case "$_sc_domain" in
+            _*) continue ;;  # private helper dirs are not HA domains
+        esac
+        [ -d "${HOME}/.homeant/custom_components/$_sc_domain" ] || continue
+        rm -rf -- "${HOME}/.homeant/custom_components/$_sc_domain"
+        info "deleting custom_components/$_sc_domain"
+    done
+}
+
+# `--upgrade` in an unstamped tree.  There is no version to download - the
+# packager stamps a *copy* - but "bring the deployment up to date with the tree
+# you are standing in" is still a real action, and the one a developer asks for
+# by editing these files.  That is the same meaning the mode has in a published
+# tree; only the transport differs (nothing to fetch, so redeploy in place).
+#
+# Order is the whole fix, not an implementation detail:
+#   1. stop  - `start` is idempotent.  With HA still running it finds nothing
+#              to do, so the domains removed in step 2 would only come back on
+#              the next restart - possibly a day later, and looking like the
+#              redeploy silently failed.
+#   2. remove the domains this tree ships (the scan above, shared with install)
+#   3. start - `_seed_ready()` now answers false, so start copies them in.
+#
+# --no-upgrade for the same reason the install path uses it: this script is the
+# installer, and handing back to a "newer release" would replace this tree.
+_redeploy_source_tree() {
+    cd "$_here" || _fatal "cannot enter tree: $(_tilde "$_here")"
+    info "no version to download - redeploying this tree"
+    info "homeant stop ..."
+    ./homeant stop || _fatal "stop failed - fix the line above, then re-run"
+    _replace_shipped_components "$_here"
+    info "homeant start ..."
+    ./homeant start --no-upgrade ||
+        _fatal "start did not finish - fix the line above, then re-run: cd \"$_here\" && ./homeant start"
+}
+
+# --- banner ---------------------------------------------------------------
+# The same two lines `homeant` opens with, down to the wording, and the first
+# thing this script prints - only the tag differs (`[install]` here,
+# `[homeant]` there), so a pasted log names its own program while both sides
+# still answer "which build?" without being asked. The version
+# is the stamp; an unstamped copy (this tree's own installer) falls back to the
+# pyproject.toml beside it - the field homeant.py::_local_version() reads, so
+# the two sides cannot disagree. "unknown" only when neither is there.
+# `$(pwd)` rather than `$_here` because this runs before the relocate below.
+_banner_version="$HOMEANT_VERSION"
+if ! printf '%s\n' "$_banner_version" | grep -qE '^[0-9]+(\.[0-9]+)*$'; then
+    _banner_version="unknown"
+    for _cand in "$(pwd)" "$(dirname "$0")/.."; do
+        if [ -f "$_cand/pyproject.toml" ]; then
+            _found="$(sed -n 's/^version[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' \
+                "$_cand/pyproject.toml" | head -1)"
+            if [ -n "${_found:-}" ]; then
+                _banner_version="$_found"
+                break
+            fi
+        fi
+    done
+fi
+printf '[install] HomeAnt — Control home through Agent.\n[install] version %s\n' "$_banner_version"
 
 # --- upgrade mode: argv only, one spelling ---
 # `--upgrade` repurposes this script: instead of refusing an existing tree it
-# takes it as the overwrite target (the guard below is what changes in T6).
+# takes it as the overwrite target (the guard below switches on it).
 # Nothing else is accepted - no -Upgrade / -u alias, no HOMEANT_UPGRADE env -
 # because every dispatch form we support can pass an argument
 # (sh -s -- --upgrade), so a second channel would only add a way to get it wrong.
+#
+# Unrecognised arguments are *ignored*, deliberately. Nobody types at this
+# script: it never lands on disk - homeant fetches the text and feeds it to
+# `sh -s --`, so the only argv it ever sees is the one homeant builds itself.
+# A usage screen, a --help and a "unknown argument" refusal would serve a
+# caller that does not exist, and a usage screen is a promise.
+# The grammar stays closed at one flag, correctly spelled.
+#
 # Two POSIX traps avoided here:
 #   * `if` instead of `[ "$_a" = ... ] && ...`: that one-liner returns 1 for the
 #     last non-matching argument, and under `set -e` that aborts the script.
@@ -269,9 +414,12 @@ if [ "$UPGRADE_MODE" = false ] && [ -n "${HOME:-}" ]; then
         # set -e alone would kill the script on a read-only or full $HOME with
         # no message whatsoever - `curl | sh` would just return 1 and the user
         # would have nothing to act on.  Both failures name the directory.
-        mkdir -p "$_here" || _fatal "cannot create install directory: $_here"
-        cd "$_here" || _fatal "cannot enter install directory: $_here"
-        info "installing into $_here"
+        # Named as ~/homeant rather than /Users/<someone>/homeant: the path is
+        # theirs, and the same three lines then read identically on every
+        # platform (see _tilde).
+        mkdir -p "$_here" || _fatal "cannot create install directory: $(_tilde "$_here")"
+        cd "$_here" || _fatal "cannot enter install directory: $(_tilde "$_here")"
+        info "installing into $(_tilde "$_here")"
     fi
 fi
 _is_tree=false
@@ -284,10 +432,10 @@ if [ "$UPGRADE_MODE" = true ]; then
     # it *is* one costs nothing and stops a mistyped command from unpacking
     # ~14k files into $HOME or /.
     if [ "$_is_tree" = false ]; then
-        _fatal "upgrade target is not a HomeAnt tree: $_here"
+        _fatal "upgrade target is not a HomeAnt tree: $(_tilde "$_here")"
     fi
 elif [ "$_is_tree" = true ]; then
-    info "HomeAnt source found in $_here"
+    info "HomeAnt source found in $(_tilde "$_here")"
     info "Run command:"
     info "  ./homeant start"
     exit 0
@@ -299,10 +447,21 @@ fi
 # POSIX sh has no [[ ]] / =~, so validate the value with grep -E; `if !`
 # keeps the guard out of errexit (a false test must not abort the good path).
 if ! printf '%s\n' "$HOMEANT_VERSION" | grep -qE '^[0-9]+(\.[0-9]+)*$'; then
-    # Reaching this means "not inside a source tree" (the guard above already
-    # returned for that case) AND "no version stamped on me" - i.e. a copy of
-    # this file was taken out of the source tree and run somewhere else.
-    # No install-method menu here (removed 2026-10-26): the guard above already
+    # Two ways in, and they need different words.  In fresh mode the guard above
+    # already returned for a source tree, so this is a copy of this file taken out
+    # of the tree and run somewhere else.  In upgrade mode it is the opposite case:
+    # only a source tree is accepted as the target (see the guard above), and a
+    # source tree is by definition never stamped - the packager stamps a *copy*.
+    # So there is nothing to fetch, which is a fact about the tree and not a
+    # failure: `--upgrade` means "make the deployment match this tree", and in a
+    # tree that is done in place.  Why each step is in that order, and why the
+    # scan is shared with the install path, live next to _redeploy_source_tree.
+    # Same wording as install.ps1.
+    if [ "$UPGRADE_MODE" = true ]; then
+        _redeploy_source_tree
+        exit 0
+    fi
+    # No install-method menu here: the guard above already
     # tells a source-tree user to run ./homeant start, so listing it again
     # as "option 1" made the two branches say the same thing twice.
     # `exit 1` is the only way POSIX sh reports failure - a script that just
@@ -388,6 +547,47 @@ fetch_script() {   # $1=url  $2=label
     printf '%s' "$s"
 }
 
+# --- helper: sha256 of a file, first tool that exists ---
+# No single tool covers the three targets: coreutils ships sha256sum on Linux,
+# macOS has only shasum (perl) plus openssl, busybox has sha256sum and no
+# shasum. Prints the hex digest on stdout; returns 1 when no tool exists, which
+# the caller must read as "cannot check" and never as "matches".
+sha256_of() {   # $1=path
+    if command -v sha256sum >/dev/null 2>&1; then
+        sha256sum "$1" | cut -d' ' -f1
+    elif command -v shasum >/dev/null 2>&1; then
+        shasum -a 256 "$1" | cut -d' ' -f1
+    elif command -v openssl >/dev/null 2>&1; then
+        # "SHA2-256(file)= hex" on 3.x, "SHA256(file)= hex" on 1.1 - cut at "="
+        openssl dgst -sha256 "$1" | sed 's/.*= *//'
+    else
+        return 1
+    fi
+}
+
+# --- helper: verify the downloaded zip against the digest stamped in above ---
+# 0 = match, 1 = mismatch, 2 = could not check.  2 is deliberately not an error:
+# a box with no sha256 tool must still be able to install, and an installer run
+# straight from the source tree carries no digest to compare.  Neither case is
+# reported as a pass - "verified" and "unchecked" are different facts and the
+# caller says which one it got.
+#
+# Catches: a transfer that changed the bytes, and a zip that is not the release
+# this script was packed for (e.g. only the zip got refreshed on the CDN).
+# Cannot catch: a digest and a zip that were both wrong when this script was
+# packed - nothing inside a release can outvote its own build.  Catching that
+# needs a read-back after upload, on the publishing side.
+verify_zip_digest() {   # $1=zip path
+    local want got
+    want=$(printf '%s' "$HOMEANT_ZIP_SHA256" | tr 'A-F' 'a-f')
+    # 64 hex or nothing to compare against: the unstamped literal is a
+    # placeholder, and an empty value is a build that dropped the stamp.
+    [ ${#want} -eq 64 ] || return 2
+    got=$(sha256_of "$1") || return 2
+    [ "$want" = "$got" ] || return 1
+    return 0
+}
+
 # --- helper: expand the release zip straight into a directory ---
 # The zip is a flat mirror of the project root - pyproject.toml sits at its top
 # level - so extracting into $dest_dir installs in place: no wrapper dir to
@@ -408,7 +608,7 @@ extract_here() {
     wait "$dot_pid" 2>/dev/null || true
     printf '\n'
     [ "$rc" -eq 0 ] || _fatal "${_zip_err:-zip extract failed: $zip_path}"
-    [ -f "$dest_dir/pyproject.toml" ] || _fatal "zip did not expand into $dest_dir - unexpected archive layout"
+    [ -f "$dest_dir/pyproject.toml" ] || _fatal "zip did not expand into $(_tilde "$dest_dir") - unexpected archive layout"
 }
 
 # ============================================================
@@ -442,6 +642,19 @@ trap 'if [ -n "${tmp_zip:-}" ]; then rm -f "$tmp_zip" || true; fi' EXIT
 # carry it in the message, since its Invoke-WebRequest error is swallowed by the
 # job); information ends up equal, only the channel differs.
 download "$ZIP_URL" "$tmp_zip" || { rm -f "$tmp_zip"; _fatal "download failed: $ZIP_URL"; }
+# Before the 14k-file extract, not after: a bad archive must not be able to
+# half-populate a tree first.  The case statement is what keeps "unchecked"
+# visibly distinct from "verified" - folding 2 into either branch would make a
+# missing digest look like a pass, which is the failure mode a checksum exists
+# to prevent.
+digest_rc=0
+verify_zip_digest "$tmp_zip" || digest_rc=$?
+case "$digest_rc" in
+    0) : ;;
+    1) rm -f "$tmp_zip"
+       _fatal "checksum mismatch: $tmp_zip is not the HomeAnt-${HOMEANT_VERSION} this script was packed for - retry once; if it repeats, the published zip is the wrong file" ;;
+    *) info "note: zip checksum not verified (no sha256 tool, or this installer carries no stamped digest)" ;;
+esac
 extract_here "$tmp_zip" "$repo_root"
 rm -f "$tmp_zip"
 
@@ -456,10 +669,10 @@ rm -f "$tmp_zip"
 # valid even if a later step changes directory (the zip extract runs in a subshell).
 if [ -x "$repo_root/.tools/uv/uv" ]; then
     uv_bin="$repo_root/.tools/uv/uv"
-    info "uv in .tools: $uv_bin ($($uv_bin --version))"
+    info "uv in .tools: $(_tilde "$uv_bin") ($($uv_bin --version))"
 elif command -v uv >/dev/null 2>&1; then
     uv_bin=$(command -v uv)
-    info "uv on PATH: $uv_bin ($($uv_bin --version))"
+    info "uv on PATH: $(_tilde "$uv_bin") ($($uv_bin --version))"
 else
     mkdir -p "$repo_root/.tools/uv"
     export UV_INSTALL_DIR="$repo_root/.tools/uv"
@@ -513,7 +726,7 @@ fi
 # Stop our Home Assistant - re-install must not race with a live process
 # (uv sync cannot replace files the running instance holds open).
 #
-# The unit is the whole job now: since T5 it is the only thing that starts hass
+# The unit is the whole job now: it is the only thing that starts hass
 # on this box, so one `systemctl --user stop` replaces the old pid hunt and its
 # group kill.  Deliberately `stop` and not `disable` - an upgrade must not change
 # whether this service comes back after a reboot, and `start` at the bottom
@@ -569,37 +782,15 @@ chmod +x ./homeant || _fatal "cannot set +x on ./homeant"
 # ============================================================
 # replace the integrations this release ships
 # ============================================================
-# ~/.homeant/custom_components is written by `homeant start`, and start only
-# fills gaps: a missing target is copied, an existing one is merged — and a
-# merge cannot rewrite a .py (only yaml/json have merge semantics).  A fixed
-# integration would therefore never reach an install that already had one.
-#
-# Install is the step that owns versions, so it (a) drops the seed marker, the
-# only thing that makes start re-run its deploy at all, and (b) removes the
-# domains this release ships, so start has to *copy* them from the tree just
-# unpacked instead of merging into what is already there.
-#
-# Deleting rather than copying over is deliberate: copying into an existing
-# directory leaves behind files the release no longer ships, and HA keeps
-# importing them.  Only domains named by the two shipped sources are removed —
-# a component the user added by hand is not in that list and stays put.
-if [ -n "${HOME:-}" ] && [ -d "${HOME}/.homeant/custom_components" ]; then
-    rm -f "${HOME}/.homeant/.seed-state"
-    for _domain_dir in config/custom_components/*/ \
-                      vendor/ha_xiaomi_home/custom_components/*/; do
-        [ -d "$_domain_dir" ] || continue
-        _domain="$(basename "$_domain_dir")"
-        case "$_domain" in
-            _*) continue ;;  # private helper dirs are not HA domains
-        esac
-        [ -d "${HOME}/.homeant/custom_components/$_domain" ] || continue
-        rm -rf -- "${HOME}/.homeant/custom_components/$_domain"
-        info "replacing custom_components/$_domain"
-    done
-fi
+# Install is the step that owns versions, so it drops the seed marker and
+# removes the domains this tree ships; `start` below then has to *copy* them
+# from the tree just unpacked instead of merging into what is already there.
+# The scan itself is _replace_shipped_components, shared with `--upgrade` in a
+# source tree so the two paths can never delete different sets.
+_replace_shipped_components "$repo_root"
 
 info "homeant start ..."
-# --no-install: this script has just unpacked the newest release and synced the
+# --no-upgrade: this script has just unpacked the newest release and synced the
 # venv, so the two things `start` would otherwise do first — probe the release
 # host and hand back to this script — can only be wrong. Handing back is what would make
 # the loop endless.
@@ -612,4 +803,4 @@ info "homeant start ..."
 # FAILED is how a good install gets reinstalled in a loop that cannot end
 # differently — so say what is actually wrong and what to do, and keep rc=1 for
 # the automation that only reads the exit code.
-./homeant start --no-install || _fatal "start did not finish - fix the line above, then re-run: ./homeant start"
+./homeant start --no-upgrade || _fatal "start did not finish - fix the line above, then re-run: cd \"$_here\" && ./homeant start"

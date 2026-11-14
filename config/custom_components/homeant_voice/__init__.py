@@ -100,30 +100,40 @@ async def async_setup(hass, config):
         targets = _find_targets()
         if not targets:
             return False
+        exposed = []
         for entity_id in targets:
             async_expose_entity(hass, ASSISTANT, entity_id, True)
             # Self-check: async_set_assistant_option can silently no-op when
             # the entity is not in the registry yet (the legacy-store trap).
-            if not async_should_expose(hass, ASSISTANT, entity_id):
+            if async_should_expose(hass, ASSISTANT, entity_id):
+                exposed.append(entity_id)
+            else:
                 _LOGGER.warning(
                     "Exposed %s but self-check failed (not in registry yet?)",
                     entity_id,
                 )
-        _LOGGER.info("Voice bridge exposed to Assist: %s", ", ".join(targets))
-        return True
+        if exposed:
+            _LOGGER.info("Voice bridge exposed to Assist: %s", ", ".join(exposed))
+        # The return value decides whether _on_start keeps a registry listener.
+        # Reporting success while an entity failed left the bridge permanently
+        # half-exposed: nothing retried, because nothing knew.
+        return len(exposed) == len(targets)
 
     @callback
     def _on_start(_event):
         if _expose_all():
             return
-        # Script not registered at START (or renamed after boot): watch the
-        # registry so a late/renamed script still converges.
-        _LOGGER.warning(
-            "No script named %r found; voice bridge inactive. Check "
-            "config/scripts.yaml alias, or set %s.expose_entities",
-            SCRIPT_ALIAS,
-            DOMAIN,
-        )
+        # Either the script is not registered yet, or it is registered but not
+        # exposable yet (the legacy-store trap above).  Both converge on a later
+        # registry event, so the listener goes up in both cases — the warning
+        # names the missing script only when that is actually the situation.
+        if not _find_targets():
+            _LOGGER.warning(
+                "No script named %r found; voice bridge inactive. Check "
+                "config/scripts.yaml alias, or set %s.expose_entities",
+                SCRIPT_ALIAS,
+                DOMAIN,
+            )
 
         @callback
         def _on_registry_updated(_event):

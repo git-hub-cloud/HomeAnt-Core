@@ -24,6 +24,36 @@ dependencies = [
     # Keep in step with core/homeassistant/components/mcp_server/manifest.json.
     "mcp==2.3.0",
     "aiohttp_sse==2.2.0",
+    # Built-in MQTT broker.  A pip dependency on purpose: mosquitto ships no
+    # arm64 / macOS binaries, so distributing it would mean maintaining a cross
+    # compiler, while amqtt is pure Python and measured 8/8 on the behaviours we
+    # need (rejecting a bad password, argon2 file auth, retained replay, LAN
+    # reachability on 0.0.0.0, 50 concurrent connects).  The broker runs as a
+    # child of `start`, never as a system service.
+    "amqtt==0.12.1",
+    # Two integrations HA loads on its own whose requirements are NOT part of
+    # the core dependency set: `hassio` (mqtt lists it in after_dependencies,
+    # and backup/analytics pull it in) and `ipp` (started by discovery).  HA
+    # fetches them at runtime with `uv pip install --upgrade`, which re-resolves
+    # the tree and tries to bump multidict 6.9.1 → 7.2.1; by then this process
+    # has already imported that .pyd, Windows refuses the rename (os error 5),
+    # the install rolls back, and every component waiting on those requirements
+    # fails to set up — measured 11-18 on Win11: mqtt/backup/analytics all
+    # "Requirements for hassio not found", so the broker never started.
+    # Locked here so `uv sync` installs them before hass runs, while nothing
+    # holds the file open.  Keep in step with
+    # core/homeassistant/components/{hassio,ipp}/manifest.json.
+    "aiohasupervisor==0.8.1",
+    "aioipp==0.20.0",
+    # DLNA renderer support (D25): `dlna_dmr` declares these in its manifest,
+    # and HA would otherwise fetch them at runtime with `uv pip install
+    # --upgrade` — the same Windows file-lock hazard as hassio above.  Lock them
+    # here so `uv sync` installs them before hass imports anything.  Keep in
+    # step with core/homeassistant/components/dlna_dmr/manifest.json.
+    # `async-upnp-client` also appears in constraint-dependencies (pin only,
+    # no install); `getmac` is unconstrained by HA entirely.
+    "async-upnp-client==0.49.0",
+    "getmac==0.9.6",
 ]
 
 # Aliyun PyPI mirror (primary, replaces default pypi.org)

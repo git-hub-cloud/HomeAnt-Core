@@ -20,8 +20,27 @@ $ProgressPreference   = "SilentlyContinue"
 # version straight out of this line, so one regex serves both platforms.
 $HOMEANT_VERSION  = "__HOMEANT_VERSION_PLACEHOLDER__"
 $HomeAntServer         = if ($env:HOMEANT_SERVER) { $env:HOMEANT_SERVER } else { "dl.homeant.cn" }
-$ZipUrl                = "https://$HomeAntServer/core/HomeAnt-${HOMEANT_VERSION}.zip"
-$UvInstallUrl          = "https://$HomeAntServer/uv/0.12.23/uvinstall.ps1"
+# sha256 of the release zip, computed and stamped in here by dist-pack.py at pack
+# time.  Same reasoning as HOMEANT_ZIP_SHA256 in install.sh: the digest rides
+# inside the script instead of being fetched beside the zip, so no second request
+# and no CDN entry that can hand back a digest matching the stale zip it served
+# with it.  Unstamped (run from the source tree) it stays a placeholder and
+# _zip_digest_ok reports "could not check", never a match.
+$HOMEANT_ZIP_SHA256    = "__HOMEANT_ZIP_SHA256_PLACEHOLDER__"
+# The first 8 hex of that digest, cut from the stamped value rather than stamped
+# again: two stored numbers can disagree, and that is how one platform ends up
+# fetching a file name the release host never has.  Identifier only - the bytes
+# are checked against the full 64 hex above, so a wrong prefix still stops at
+# the checksum, never at a half-installed tree.  Width must equal TAG_LEN in
+# dist-pack.py, and check_drift() refuses to pack when it does not.
+$ZipTag                = $HOMEANT_ZIP_SHA256.Substring(0, 8)
+$ZipUrl                = "https://$HomeAntServer/core/HomeAnt-${HOMEANT_VERSION}-${ZipTag}.zip"
+# uv release bootstrapped by this installer. Same role as UV_VERSION in
+# install.sh: the URL below and the CDN directory uv/<version>/ (uploaded
+# separately, never inside the zip) derive from it. Keep it equal to the
+# "uv==" pin in pyproject.toml.
+$UvVersion             = "0.13.6"
+$UvInstallUrl          = "https://$HomeAntServer/uv/${UvVersion}/uvinstall.ps1"
 # $ConnectTimeoutSec     = 15
 $TransferTimeoutSec    = 600
 # How long _stop_hass waits for hass to exit before killing it again.  The same
@@ -37,15 +56,65 @@ function _info($m) { Write-Host "[install] $m" }
 function _err($m)  { Write-Host "[install] $m" -ForegroundColor Red }
 function _fatal($m) { _err $m; throw $m }
 
+# Display form of a path: ~/rest when it sits under the profile, unchanged
+# otherwise.  The same rule install.sh's _tilde and homeant.py's _home_tilde
+# follow - forward slashes included - so a user moving between platforms, or
+# between `homeant` and the installer, never sees their own tree spelled two
+# ways.  Display only: the commands inside these messages keep absolute paths,
+# which are the ones that work wherever the tree happens to sit.
+function _Tilde([string]$Path) {
+    $profileDir = $env:USERPROFILE
+    if (-not $profileDir) { return $Path }
+    $profileDir = $profileDir.TrimEnd('\', '/')
+    if (-not $profileDir) { return $Path }
+    if ($Path -ieq $profileDir) { return '~' }
+    if ($Path.StartsWith("$profileDir\", 'OrdinalIgnoreCase') -or
+        $Path.StartsWith("$profileDir/", 'OrdinalIgnoreCase')) {
+        return '~/' + $Path.Substring($profileDir.Length + 1).Replace('\', '/')
+    }
+    return $Path
+}
+
+# --- banner ---------------------------------------------------------------
+# The same two lines `homeant` opens with, before anything else, differing only
+# in the tag (`[install]` here, `[homeant]` there): a pasted log names its own
+# program while both sides still answer "which build?" without being asked. The version is the stamp;
+# an unstamped copy (this tree's own installer) falls back to the
+# pyproject.toml beside it - the field homeant.py::_local_version() reads, so
+# the two sides cannot disagree. "unknown" only when neither is there.
+#
+# The dash is built from its code point instead of written literally: this file
+# is ASCII on purpose, because Windows PowerShell 5.1 decodes a BOM-less script
+# with the ANSI code page and would print mojibake where homeant prints a dash.
+$BannerVersion = $HOMEANT_VERSION
+if ($BannerVersion -notmatch '^[0-9]+(\.[0-9]+)*$') {
+    $BannerVersion = "unknown"
+    $BannerCands = @()
+    if ($PSScriptRoot) { $BannerCands += (Split-Path $PSScriptRoot -Parent) }
+    $BannerCands += (Get-Location).Path
+    foreach ($cand in $BannerCands) {
+        $proj = if ($cand) { Join-Path $cand "pyproject.toml" } else { $null }
+        if ($proj -and (Test-Path $proj)) {
+            $hit = Select-String -Path $proj -Pattern '^version\s*=\s*"([^"]+)"' |
+                Select-Object -First 1
+            if ($hit) { $BannerVersion = $hit.Matches[0].Groups[1].Value; break }
+        }
+    }
+}
+Write-Host ("[install] HomeAnt " + [char]0x2014 + " Control home through Agent.")
+Write-Host "[install] version $BannerVersion"
+
 # ============================================================
 # preflight - refuse BEFORE anything is downloaded or overwritten
 # ============================================================
 # Same list and same rule as install.sh's PREFLIGHT_PORTS: free is fine, our
-# own Home Assistant is fine (it gets stopped further down), anybody else is a
-# hard stop.  The MQTT broker this project will grow is one more entry here
-# plus one more in install.sh - the two lists are meant to be the same list.
+# own service is fine (it gets stopped further down), anybody else is a hard
+# stop.  1883 is the broker, 8123 is hass; both are children of
+# the supervised process, so Stop-Service frees both.  Keep the two lists
+# equal - check_drift() in dist-pack.py compares their port sets at pack time.
 $PreflightPorts = @(
-    @{ Port = 8123; Label = "Home Assistant HTTP" }
+    @{ Port = 8123; Label = "Home Assistant HTTP" },
+    @{ Port = 1883; Label = "HomeAnt MQTT" }
 )
 
 function _is_our_hass_pid($procId) {
@@ -61,6 +130,25 @@ function _is_our_hass_pid($procId) {
     if (-not $cl.Contains('--config')) { return $false }
     $root = (Join-Path $env:USERPROFILE '.homeant').Replace('\', '/')
     return ($cl.Replace('\', '/').IndexOf($root, [System.StringComparison]::OrdinalIgnoreCase) -ge 0)
+}
+
+function _is_our_broker_pid($procId) {
+    # The second daemon in the service's process tree.  Its command line has
+    # neither "--config" nor a hass.exe, so _is_our_hass_pid would call it a
+    # stranger and an upgrade on a running install would hard-stop on 1883.
+    # For example:
+    #   python.exe -m amqtt.scripts.broker_script -c <HA_ROOT>/mqtt.yaml
+    # The module name alone is not ownership: another amqtt broker on this
+    # machine is somebody else's, so the config must also live under HA_ROOT.
+    $p = Get-CimInstance Win32_Process -Filter "ProcessId=$procId" -ErrorAction SilentlyContinue
+    if (-not $p) { return $false }
+    if ($p.Name -notmatch '^python') { return $false }
+    $cl = $p.CommandLine
+    if (-not $cl) { return $false }
+    if ($cl -notmatch '-m\s+amqtt\.scripts\.broker_script') { return $false }
+    $root = (Join-Path $env:USERPROFILE '.homeant').Replace('\', '/')
+    $flat = $cl.Replace('\', '/')
+    return (($flat.IndexOf($root, [System.StringComparison]::OrdinalIgnoreCase) -ge 0) -and ($flat -match 'mqtt\.ya?ml'))
 }
 
 function _preflight {
@@ -81,10 +169,12 @@ function _preflight {
     foreach ($entry in $PreflightPorts) {
         if (-not $listen.ContainsKey($entry.Port)) { continue }   # free: nothing to say
         $owner = $listen[$entry.Port]
-        if (_is_our_hass_pid $owner) {
-            # Worded exactly as install.sh says it: the two installers answer to
-            # the same rule (keep their logic and their output in step), and a
-            # platform that stays silent here would look like it skipped a check.
+        if ((_is_our_hass_pid $owner) -or (_is_our_broker_pid $owner)) {
+            # hass owns 8123, the broker owns 1883, and both die with the
+            # service.  Worded exactly as install.sh says it: the two installers
+            # answer to the same rule (keep their logic and their output in
+            # step), and a platform that stays silent here would look like it
+            # skipped a check.
             _info "preflight: port $($entry.Port) (PID $owner) - will be stopped before uv sync"
             continue
         }
@@ -96,8 +186,8 @@ function _preflight {
     }
 
     # --- program checks (reserved) ---
-    # Non-port requirements belong here: the MQTT broker binary a later release
-    # ships, a Windows feature HA needs, a free-space budget.  Same contract as
+    # Non-port requirements belong here: a new broker binary shipped in the zip,
+    # a Windows feature HA needs, a free-space budget.  Same contract as
     # the port loop above: say what is wrong and _fatal, never warn-and-continue.
     # Nothing is added here until it has a real failure mode to catch.
     #
@@ -112,21 +202,34 @@ function _preflight {
         [System.IO.File]::WriteAllText($probe, '')
         Remove-Item $probe -Force -ErrorAction SilentlyContinue
     } catch {
-        _fatal "install directory is not writable: $Dir - change to a directory you own (e.g. cd ~) and re-run"
+        _fatal "install directory is not writable: $(_Tilde $Dir) - change to a directory you own (e.g. cd ~) and re-run"
     }
 }
 
 # --- upgrade mode: argv only, one spelling ---
 # `--upgrade` repurposes this script: instead of refusing an existing tree it
-# takes it as the overwrite target (the guard in main() is what changes in T6).
+# takes it as the overwrite target (the guard in main() switches on it).
 # Nothing else is accepted - no -Upgrade / -u alias, no HOMEANT_UPGRADE env -
 # because every dispatch form we support can pass an argument
 # (& $sb --upgrade, -File ... --upgrade); `irm ... | iex` cannot, and that is
 # exactly the fresh-install case, so it needs none.
 # Script scope on purpose: $args read inside main() would be main()'s own
 # parameter list (empty), not the script's - the two are not the same variable.
+#
+# "Nothing else is accepted" is meant as a closed grammar, not as an error path.
+# Unrecognised arguments are ignored, deliberately: this script never lands on
+# disk - homeant fetches it and parses the text in memory (scriptblock::Create)
+# before handing $args in - so the only argv it ever sees is the one homeant
+# builds itself. A usage screen, a --help and an "unknown argument" refusal
+# would serve a caller that does not exist; a usage screen is a promise.
+# ASCII only, like the rest of this file: PS 5.1 decodes a BOM-less script as
+# ANSI, so a curly quote here would arrive mangled.
 $UpgradeMode = $false
-foreach ($__a in $args) { if ($__a -eq '--upgrade') { $UpgradeMode = $true } }
+foreach ($__a in $args) {
+    if ($__a -eq '--upgrade') {
+        $UpgradeMode = $true
+    }
+}
 
 # Transfers are slow enough to look hung, but PowerShell's Write-Progress leaves
 # post-completion glyphs on the line that can't be cleared reliably across hosts
@@ -183,6 +286,35 @@ function _download {
     Remove-Job $job -Force
     if ($failed) { throw "download failed: $url - $($err -join '; ')" }
 }
+# 0 = match, 1 = mismatch, 2 = could not check. 2 is deliberately not an error:
+# an installer run straight from the source tree still carries the placeholder,
+# and a host without the cmdlet must still be able to install. Neither becomes a
+# pass - "verified" and "unchecked" are different facts and the caller says
+# which one it got.
+#
+# Catches: a transfer that changed the bytes, and a zip that is not the release
+# this script was packed for (e.g. only the zip got refreshed on the CDN).
+# Cannot catch: a digest and a zip that were both wrong when this script was
+# packed - nothing inside a release can outvote its own build. That needs a
+# read-back after upload, on the publishing side.
+#
+# Get-FileHash ships with PS 4+, so it is always there; it is still probed rather
+# than assumed, because a missing cmdlet must degrade to "unchecked" instead of
+# aborting an install half way with module-not-found.
+function _zip_digest_ok($zipPath) {
+    if (-not (Get-Command Get-FileHash -ErrorAction SilentlyContinue)) { return 2 }
+    $want = $HOMEANT_ZIP_SHA256
+    if (-not ($want -match '^[0-9a-fA-F]{64}$')) { return 2 }
+    try {
+        $got = (Get-FileHash -LiteralPath $zipPath -Algorithm SHA256).Hash
+    } catch {
+        return 2
+    }
+    # Get-FileHash reports upper case, the stamp is lower case; PS -eq ignores
+    # case anyway, normalised so a reader does not have to know that.
+    if ($got -eq $want.ToLower()) { return 0 } else { return 1 }
+}
+
 # The zip is a flat mirror of the project root - pyproject.toml sits at its
 # top level - so expanding into $destDir installs in place: no wrapper dir to
 # lift, no temp staging, no copy step. Overwrites in place, which is also what
@@ -241,7 +373,7 @@ function _extract_here($zipPath, $destDir) {
         throw "zip extract failed: $zipPath - $($err -join '; ')"
     }
     if (-not (Test-Path (Join-Path $destDir "pyproject.toml"))) {
-        throw "zip did not expand into $destDir - unexpected archive layout"
+        throw "zip did not expand into $(_Tilde $destDir) - unexpected archive layout"
     }
 }
 
@@ -256,14 +388,14 @@ function _is_admin {
 }
 
 function _stop_service {
-    # Since T9 the SCM is the only thing that starts hass on Windows, so one
+    # The SCM is the only thing that starts hass on Windows, so one
     # Stop-Service replaces the pid hunt whenever a registration exists.
     # Deliberately "stop" and not "set to demand start": an upgrade must not
     # change whether this home comes back after a reboot.
     #
     # Returns $true when a registration exists - running or not - so the caller
     # knows the pid tier below has nothing left to do.  $false means no
-    # registration, which is either a fresh install or a tree from before T9
+    # registration, which is either a fresh install or a tree from an older build
     # whose hass was spawned directly; that second case still needs the hunt.
     $svc = Get-Service -Name $ServiceName -ErrorAction SilentlyContinue
     if (-not $svc) { return $false }
@@ -296,7 +428,7 @@ function _stop_hass {
     # straight back into the tree uv sync is replacing.
     if (_stop_service) { return }
 
-    # Tier 2 (pre-T9 trees only): a hass that no SCM knows about, started
+    # Tier 2 (older trees only): a hass that no SCM knows about, started
     # directly by a build that had no service.  Deleted together with the pid
     # tier it belongs to once `start` refuses to leave anything unsupervised.
     #
@@ -416,6 +548,89 @@ function _stop_hass {
     }
 }
 
+# ============================================================
+# replace the integrations this tree ships
+# ============================================================
+# ~/.homeant/custom_components is written by `homeant start`, and start only
+# fills gaps: a missing target is copied, an existing one is merged - and a
+# merge cannot rewrite a .py (only yaml/json have merge semantics).  A fixed
+# integration would therefore never reach a deployment that already had one.
+#
+# Two callers, one rule: the published install (bottom of main()) and
+# `--upgrade` inside a source tree.  Both end in `homeant start`, so both need
+# the same "remove what this tree ships, then let start copy it in" step - and
+# both must remove exactly the same set, which is why the scan lives here once
+# instead of being written twice and drifting.
+#
+# Deleting rather than copying over is deliberate: copying into an existing
+# directory leaves behind files the tree no longer ships, and HA keeps
+# importing them.  Only domains named by the two shipped sources are removed -
+# a component the user added by hand is not in that list and stays put.
+#
+# $Root is the tree to read the domain names from; the target is always
+# $env:USERPROFILE\.homeant\custom_components.  Same text as install.sh.
+function _ReplaceShippedComponents([string]$Root) {
+    $haCc = Join-Path $env:USERPROFILE ".homeant\custom_components"
+    if (-not (Test-Path $haCc)) { return }
+    # Drop the seed marker too: it is the other thing `start` consults before
+    # deciding that its deploy already ran.
+    $seedMarker = Join-Path $env:USERPROFILE ".homeant\.seed-state"
+    if (Test-Path $seedMarker) {
+        Remove-Item $seedMarker -Force -ErrorAction SilentlyContinue
+    }
+    $ccSources = @(
+        (Join-Path $Root "config\custom_components"),
+        (Join-Path $Root "vendor\ha_xiaomi_home\custom_components")
+    )
+    foreach ($ccSrc in $ccSources) {
+        if (-not (Test-Path $ccSrc)) { continue }
+        foreach ($ccDir in (Get-ChildItem -Path $ccSrc -Directory)) {
+            if ($ccDir.Name.StartsWith('_')) { continue }
+            $ccTarget = Join-Path $haCc $ccDir.Name
+            if (Test-Path $ccTarget) {
+                Remove-Item $ccTarget -Recurse -Force
+                _info "deleting custom_components/$($ccDir.Name)"
+            }
+        }
+    }
+}
+
+# `--upgrade` in an unstamped tree.  There is no version to download - the
+# packager stamps a *copy* - but "bring the deployment up to date with the tree
+# you are standing in" is still a real action, and the one a developer asks for
+# by editing these files.  That is the same meaning the mode has in a published
+# tree; only the transport differs (nothing to fetch, so redeploy in place).
+#
+# Order is the whole fix, not an implementation detail:
+#   1. stop  - `start` is idempotent.  With HA still running it finds nothing
+#              to do, so the domains removed in step 2 would only come back on
+#              the next restart - possibly a day later, and looking like the
+#              redeploy silently failed.
+#   2. remove the domains this tree ships (the scan above, shared with install)
+#   3. start - `_seed_ready()` now answers false, so start copies them in.
+#
+# --no-upgrade for the same reason the install path uses it: this script is the
+# installer, and handing back to a "newer release" would replace this tree.
+# Push/Pop-Location because `.\homeant` resolves against the tree, not the
+# caller's cwd.  Same text as install.sh.
+function _RedeploySourceTree([string]$Root) {
+    _info "no version to download - redeploying this tree"
+    Push-Location $Root
+    try {
+        _info "homeant stop ..."
+        & .\homeant stop
+        if ($LASTEXITCODE -ne 0) { _fatal "stop failed - fix the line above, then re-run" }
+        _ReplaceShippedComponents $Root
+        _info "homeant start ..."
+        & .\homeant start --no-upgrade
+        if ($LASTEXITCODE -ne 0) {
+            _fatal "start did not finish - fix the line above, then re-run: cd '$Root'; .\homeant start"
+        }
+    } finally {
+        Pop-Location
+    }
+}
+
 function main() {
     if ($UpgradeMode) { _info "mode: upgrade" } else { _info "mode: fresh install" }
 
@@ -431,10 +646,12 @@ function main() {
             # Worded exactly as install.sh: a read-only or full profile would
             # otherwise surface as a raw New-Item error with the same facts in a
             # different shape.  -ErrorAction Stop so the catch is reached at all.
+            # The path prints as ~/homeant, same as install.sh - it is the user's
+            # own tree, and both platforms then hand over the same sentence.
             try { New-Item -ItemType Directory -Path $__newDir -Force -ErrorAction Stop | Out-Null }
-            catch { _fatal "cannot create install directory: $__newDir" }
+            catch { _fatal "cannot create install directory: $(_Tilde $__newDir)" }
             Set-Location $__newDir
-            _info "installing into $__newDir"
+            _info "installing into $(_Tilde $__newDir)"
         }
     }
 
@@ -452,9 +669,9 @@ function main() {
         # --upgrade means "overwrite the tree you are standing in". Requiring that
         # it *is* one costs nothing and stops a mistyped command from unpacking
         # ~14k files into $HOME or C:\.
-        if (-not $isTree) { _fatal "upgrade target is not a HomeAnt tree: $here" }
+        if (-not $isTree) { _fatal "upgrade target is not a HomeAnt tree: $(_Tilde $here)" }
     } elseif ($isTree) {
-        _info "HomeAnt source found in $here"
+        _info "HomeAnt source found in $(_Tilde $here)"
         _info "Run command:"
         _info "  .\homeant start"
         # Not `exit`: under `irm ... | iex` this body runs inline in the caller's
@@ -469,13 +686,29 @@ function main() {
     # positive check ("is this a real version?") - never compare against the
     # placeholder literal here, or the packager's global replace rewrites the guard too
     if ($HOMEANT_VERSION -notmatch '^\d+(\.\d+)*$') {
-        # Reaching this means "not inside a source tree" (the guard above already
-        # returned for that case) AND "no version stamped on me" - i.e. a copy of
-        # this file was taken out of the source tree and run somewhere else.
-        # No install-method menu here (removed 2026-10-26): the guard above
+        # Two ways in, and they need different words.  In fresh mode the guard
+        # above already returned for a source tree, so this is a copy of this file
+        # taken out of the tree and run somewhere else.  In upgrade mode it is the
+        # opposite case: only a source tree is accepted as the target (see the
+        # guard above), and a source tree is by definition never stamped - the
+        # packager stamps a *copy*.  So there is nothing to fetch, which is a fact
+        # about the tree and not a failure: `--upgrade` means "make the deployment
+        # match this tree", and in a tree that is done in place.  Why each step is
+        # in that order, and why the scan is shared with the install path, live
+        # next to _RedeploySourceTree.  Same wording as install.sh.
+        #
+        # `$global:LASTEXITCODE = 0` + `return`, never `exit`: under
+        # `irm ... | iex` that body runs in the caller's session and `exit 0`
+        # tears down their console window (see the contract at the bottom of
+        # this file).  Same shape as the fresh-mode early return above.
+        if ($UpgradeMode) {
+            _RedeploySourceTree $here
+            $global:LASTEXITCODE = 0
+            return
+        }
+        # No install-method menu here: the guard above
         # already points a source-tree user at homeant start, so listing it
         # again as "option 1" made the two branches say the same thing twice.
-        # Same text as install.sh.
         # Bare throw, not _fatal: _fatal would re-print its message. And never
         # `exit` here - under `irm ... | iex` that tears down the caller's own
         # console window (see the contract at the bottom of this file).
@@ -513,6 +746,15 @@ function main() {
     $tmpZip = Join-Path $env:TEMP "HomeAnt-${HOMEANT_VERSION}.${PID}.zip"
     try {
         _download $ZipUrl $tmpZip "downloading HomeAnt-${HOMEANT_VERSION}"
+        # Before the extract, not after: a bad archive must not be able to
+        # half-populate a tree first. The default branch keeps "unchecked"
+        # visibly distinct from "verified" - folding it into either other case
+        # would make a missing digest look like a pass.
+        switch (_zip_digest_ok $tmpZip) {
+            0 { }
+            1 { throw "checksum mismatch: $tmpZip is not the HomeAnt-${HOMEANT_VERSION} this script was packed for - retry once; if it repeats, the published zip is the wrong file" }
+            default { _info "note: zip checksum not verified (no sha256 tool, or this installer carries no stamped digest)" }
+        }
         _extract_here $tmpZip $RepoRoot
     } catch {
         # No prefix here: _download and _extract_here already say what failed.
@@ -534,12 +776,12 @@ function main() {
     $UvExe = Join-Path $UvDir "uv.exe"
     if (Test-Path $UvExe) {
         $uvCmd = $UvExe
-        _info "uv in .tools: $uvCmd ($(& $uvCmd --version))"
+        _info "uv in .tools: $(_Tilde $uvCmd) ($(& $uvCmd --version))"
     } else {
         $pathUv = (Get-Command uv -ErrorAction SilentlyContinue).Source
         if ($pathUv) {
             $uvCmd = $pathUv
-            _info "uv on PATH: $uvCmd ($(& $uvCmd --version))"
+            _info "uv on PATH: $(_Tilde $uvCmd) ($(& $uvCmd --version))"
         } else {
             New-Item -ItemType Directory -Path $UvDir -Force | Out-Null
             $env:UV_INSTALL_DIR     = $UvDir
@@ -583,6 +825,13 @@ function main() {
             # label passed: without it the progress line has no "[install] ..." prefix
             # and no file name, just a bare "2.6 / 19.4MB" redrawing itself.
             _download $ZipUrl $tmpZip "downloading HomeAnt-${HOMEANT_VERSION}"
+            # Same gate as the first download: repairing a tree with a zip that
+            # is not the published one would leave a mixed tree behind.
+            switch (_zip_digest_ok $tmpZip) {
+                0 { }
+                1 { throw "checksum mismatch: $tmpZip is not the HomeAnt-${HOMEANT_VERSION} this script was packed for - retry once; if it repeats, the published zip is the wrong file" }
+                default { _info "note: zip checksum not verified (no sha256 tool, or this installer carries no stamped digest)" }
+            }
             _extract_here $tmpZip $RepoRoot
             # throw, not _fatal - the catch below owns the reporting (same reason as
             # _extract_here). _fatal here would report twice.
@@ -629,45 +878,15 @@ function main() {
     # ============================================================
     # replace the integrations this release ships
     # ============================================================
-    # ~/.homeant/custom_components is written by `homeant start`, and start only
-    # fills gaps: a missing target is copied, an existing one is merged - and a
-    # merge cannot rewrite a .py (only yaml/json have merge semantics).  A fixed
-    # integration would therefore never reach an install that already had one.
-    #
-    # Install is the step that owns versions, so it (a) drops the seed marker,
-    # the only thing that makes start re-run its deploy at all, and (b) removes
-    # the domains this release ships, so start has to *copy* them from the tree
-    # just unpacked instead of merging into what is already there.
-    #
-    # Deleting rather than copying over is deliberate: copying into an existing
-    # directory leaves behind files the release no longer ships, and HA keeps
-    # importing them.  Only domains named by the two shipped sources are removed
-    # - a component the user added by hand is not in that list and stays put.
-    $haCc = Join-Path $env:USERPROFILE ".homeant\custom_components"
-    if (Test-Path $haCc) {
-        $seedMarker = Join-Path $env:USERPROFILE ".homeant\.seed-state"
-        if (Test-Path $seedMarker) {
-            Remove-Item $seedMarker -Force -ErrorAction SilentlyContinue
-        }
-        $ccSources = @(
-            (Join-Path $RepoRoot "config\custom_components"),
-            (Join-Path $RepoRoot "vendor\ha_xiaomi_home\custom_components")
-        )
-        foreach ($ccSrc in $ccSources) {
-            if (-not (Test-Path $ccSrc)) { continue }
-            foreach ($ccDir in (Get-ChildItem -Path $ccSrc -Directory)) {
-                if ($ccDir.Name.StartsWith('_')) { continue }
-                $ccTarget = Join-Path $haCc $ccDir.Name
-                if (Test-Path $ccTarget) {
-                    Remove-Item $ccTarget -Recurse -Force
-                    _info "replacing custom_components/$($ccDir.Name)"
-                }
-            }
-        }
-    }
+    # Install is the step that owns versions, so it drops the seed marker and
+    # removes the domains this tree ships; `start` below then has to *copy* them
+    # from the tree just unpacked instead of merging into what is already there.
+    # The scan itself is _ReplaceShippedComponents, shared with `--upgrade` in a
+    # source tree so the two paths can never delete different sets.
+    _ReplaceShippedComponents $RepoRoot
 
     _info "homeant start ..."
-    # --no-install: this script has just unpacked the newest release and synced
+    # --no-upgrade: this script has just unpacked the newest release and synced
     # the venv, so the two things `start` would otherwise do first - probe the
     # release host and hand back to this script - can only be wrong. Handing
     # back is what would make the loop endless.
@@ -680,10 +899,10 @@ function main() {
     # Reporting it as FAILED is how a good install gets reinstalled in a loop
     # that ends the same way - so say what is actually wrong and what to do, and
     # keep rc=1 for the automation that only reads the exit code.
-    & .\homeant start --no-install
+    & .\homeant start --no-upgrade
     $startRc = $LASTEXITCODE
     if ($startRc -ne 0) {
-        _fatal "start did not finish - fix the line above, then re-run: .\homeant start"
+        _fatal "start did not finish - fix the line above, then re-run: cd '$here'; .\homeant start"
     }
 } # end main
 

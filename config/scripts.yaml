@@ -47,7 +47,8 @@ homeant_voice:
   # （homeant_voice 组件靠 friendly_name 发现并 expose 本脚本）
   alias: HomeAntVoice
   description: |
-    通过小爱音箱把一段文字朗读出来（TTS 语音播报）。
+    朗读 播报 念一下 说一段 念出来 语音播报 小爱说话 让小爱念 tts speak say voice announce
+    ── 通过小爱音箱把一段文字朗读出来（TTS 语音播报）。
     调用时机（事件驱动，无自动模式/总开关）：仅当本次回答包含任务完成通知、
     结论或摘要、提醒、告警时才调用本工具；纯对话、简单确认、追问、闲聊
     一律不调用。是否调用由你按上述语义自行判断。
@@ -179,4 +180,140 @@ homeant_voice_select:
           status: ok
           message: "已将默认音箱设为 {{ label }}（{{ speaker }}），后续播报无需再选。"
     - stop: "默认音箱已设置"
+      response_variable: result
+
+homeant_dlna_play:
+  # alias 决定 entity_id / MCP 工具名 script__homeant_dlna_play。
+  # ⚠️ 跨环境契约：alias 必须保持 HomeAntDLNAPlay（组件 expose 靠它）。
+  alias: HomeAntDLNAPlay
+  description: |
+    播放音乐 放歌 放音乐 放音频 播歌曲 听音乐 播一下 小爱音箱播放 让小爱放歌 播放文件夹
+    音箱 音响 喇叭 歌单 连播 播放列表 顺序播放 随机播放
+    play music play audio play song speaker HomeAnt homeant dlna playlist
+    ── 通过 DLNA 把音频播到默认音箱（小爱等支持 DLNA 的音箱）。
+    音频来源三选一：
+      ① http(s) 网络流/文件地址（音箱须能访问，不能是 127.0.0.1/localhost）；
+      ② 本地音频文件的绝对路径（不复制，HA 签名后供音箱拉取）；
+      ③ 本地文件夹绝对路径（整个目录展开成队列连播；不指定路径时用默认音乐目录）。
+    单曲和多曲走同一条队列：每次 play 重建队列并从第一首开始（不追加），
+    播完自动切下一首，末首后停止并清空队列。参数 mode 只在 source 是文件夹时生效：
+    sequential=按文件名顺序连播，random=随机顺序连播。单文件或 http(s) 时 mode 无意义。
+    ⚡ 多首连播：path 可用换行或 | 分隔多个来源（http 地址 / 本地文件 / 文件夹可混排），
+    一次调用就排入整条队列，无需逐首调用；解析不出音频的条目会被自动跳过，
+    全部无效才返回 no_file。302 跳转到音频的地址可直接给，音箱自己跟随跳转。
+    ⚡ 只接受指向音频本身的地址，不接受网页：搜索页/歌单页/播放器页等 HTML 页面直接投，
+    音箱拿到的是网页源码 —— 调用照样返回 ok，但没有声音，且不会报错。
+    用户给的是页面 URL 时，先自己把页面里的音频直链解析出来（读它背后的接口，
+    或从 HTML 里找 audio/m3u8 源），逐条确认取到的是音频流再放进 path；
+    解析不出来就明说拿不到，不要把页面地址本身传进来。
+    ⚡ 判断一次就够：对 http(s) 链接发一次 GET/HEAD，返回 audio/* 或音频魔数可直接投，
+    text/html 就先解析。宁可多花一次请求，也别投一个注定没声音的页面。
+    未设置默认音箱时先调用 HomeAntDLNASelect（候选来自 DLNA 扫描）。
+    返回 {"result": {status, message}}：ok / no_file / no_speaker / error。
+  icon: mdi:speaker-play
+  mode: single
+  fields:
+    path:
+      name: 音频来源
+      description: 音频直链（指向音频流本身）、本地音频文件绝对路径，或含音频的文件夹绝对路径；页面地址要先解析成音频直链再传，不要直接给网页 URL；多个来源用换行或 | 分隔可一次排入整条队列；留空用默认音乐目录
+      required: false
+      selector:
+        text:
+    mode:
+      name: 播放顺序
+      description: 文件夹时有效——sequential（顺序，默认）或 random（随机）
+      required: false
+      selector:
+        select:
+          options:
+            - sequential
+            - random
+  sequence:
+    - service: homeant_dlna.play
+      data:
+        path: "{{ path | default('', true) }}"
+        mode: "{{ mode | default('sequential', true) }}"
+      response_variable: dlna_result
+    - variables:
+        result:
+          status: "{{ dlna_result.status }}"
+          message: "{{ dlna_result.message }}"
+    - stop: "DLNA 播放已处理"
+      response_variable: result
+
+homeant_dlna_select:
+  # ⚠️ 跨环境契约：alias 必须保持 HomeAntDLNASelect（组件 expose 靠它）。
+  alias: HomeAntDLNASelect
+  description: |
+    设置默认 DLNA 音箱。speaker 传 media_player.<entity_id>（DLNA 扫描建成的
+    media_player 实体）；设置后立即生效、重启不丢。
+  icon: mdi:speaker
+  mode: single
+  fields:
+    speaker:
+      name: DLNA 音箱实体
+      description: media_player 实体 id，例如 media_player.xiaomi_s12
+      required: true
+      selector:
+        text:
+  sequence:
+    - service: input_text.set_value
+      target:
+        entity_id: input_text.homeant_dlna_speaker
+      data:
+        value: "{{ speaker }}"
+    - if:
+        - condition: template
+          value_template: "{{ speaker in (state_attr('input_select.homeant_dlna_speaker', 'options') or []) }}"
+      then:
+        - service: input_select.select_option
+          target:
+            entity_id: input_select.homeant_dlna_speaker
+          data:
+            option: "{{ speaker }}"
+    - variables:
+        result:
+          status: ok
+          message: "已将默认 DLNA 音箱设为 {{ speaker }}，后续播放无需再选。"
+    - stop: "默认 DLNA 音箱已设置"
+      response_variable: result
+
+homeant_dlna_resume:
+  # ⚠️ 跨环境契约：alias 必须保持 HomeAntDLNAResume（组件 expose 靠它）。
+  alias: HomeAntDLNAResume
+  description: |
+    续播被停止（HA 或音箱主动停止）的 DLNA 连播队列：跳回暂停时的秒数继续
+    播放；定位失败则从当前曲目开头播放。超过空闲时限（ttl）队列已清空时返回
+    expired，需重新调用 HomeAntDLNAPlay 排入。
+    返回 {"result": {status, message}}：ok / playing / no_queue / expired / error。
+  icon: mdi:playlist-play
+  mode: single
+  sequence:
+    - service: homeant_dlna.resume
+      response_variable: dlna_result
+    - variables:
+        result:
+          status: "{{ dlna_result.status }}"
+          message: "{{ dlna_result.message }}"
+    - stop: "DLNA 续播已处理"
+      response_variable: result
+
+homeant_dlna_cancel:
+  # ⚠️ 跨环境契约：alias 必须保持 HomeAntDLNACancel（组件 expose 靠它）。
+  alias: HomeAntDLNACancel
+  description: |
+    停止播放并清空 DLNA 队列，用户说「停」「别放了」「关掉音乐」时用这个。
+    停止后队列即丢弃，不能再 HomeAntDLNAResume，要听重新 HomeAntDLNAPlay 排入。
+    队列本来就是空的时候返回 no_queue，不算失败。
+    返回 {"result": {status, message}}：ok / no_queue / error。
+  icon: mdi:stop
+  mode: single
+  sequence:
+    - service: homeant_dlna.cancel
+      response_variable: dlna_result
+    - variables:
+        result:
+          status: "{{ dlna_result.status }}"
+          message: "{{ dlna_result.message }}"
+    - stop: "DLNA 停止已处理"
       response_variable: result

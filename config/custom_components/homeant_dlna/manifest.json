@@ -1,0 +1,10 @@
+{
+  "domain": "homeant_dlna",
+  "name": "HomeAnt DLNA Speaker",
+  "version": "1.0.0",
+  "documentation": "https://github.com/git-hub-cloud/HomeAnt-Core",
+  "codeowners": ["git-hub-cloud"],
+  "dependencies": ["http"],
+  "after_dependencies": ["media_player", "script"],
+  "requirements": []
+}

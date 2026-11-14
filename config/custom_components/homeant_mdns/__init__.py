@@ -17,7 +17,7 @@ anyway, so a private type carries them without polluting discovery.
 **One address, on the default gateway's own segment.**  The record carries the
 single IPv4 a LAN client can actually reach.  Announcing several A records is
 not an option here: some resolvers hand back only the first answer, and on a
-box that also runs Hyper-V, VirtualBox, WSL or Tailscale that answer can be a
+box that also runs Hyper-V, VirtualBox or Tailscale that answer can be a
 172.x virtual switch or a 100.64/10 tunnel — an address no other machine can
 reach.  A client that only honours the first record then pings into the void.
 RFC 6762 §6.2 lets a multihomed host advertise every address *of the interface
@@ -29,7 +29,7 @@ never two for the same name.
 
 Selection is by *route*, not by vendor and not by HA's adapter settings.  HA's
 ``async_load_adapters()`` marks an adapter ``auto`` from a UDP probe to
-224.0.0.251; on Windows that probe lands on the WSL/Hyper-V NAT interface, so
+224.0.0.251; on Windows that probe lands on the Hyper-V NAT interface, so
 ``enable_auto_detected_adapters()`` enables *only* that interface and
 ``async_get_adapters()`` reports no LAN address at all.  Worse,
 ``network/__init__.py:85`` rewrites a source-probe answer that is not on an
@@ -41,7 +41,7 @@ So the candidates come from ``async_get_adapters()`` **without** the
 reachability — and the source address comes from a raw UDP ``connect()`` to a
 public target: the kernel's own route lookup, which by definition picks the
 address on the default gateway's segment.  No packet is transmitted, so a
-firewalled or absent 8.8.8.8 changes nothing.  If that address is not in HA's
+firewalled or absent 223.5.5.5 changes nothing.  If that address is not in HA's
 adapter list (the list can lag a hot-plugged interface), a candidate sharing
 its configured subnet wins — the "gateway segment" fallback without parsing
 any platform's routing table.  The 224.0.0.251 probe is the second choice for
@@ -70,27 +70,6 @@ names (see below):
     Requires no admin rights and no GUI session.  mDNSResponder owns every
     interface, so the A record we hand it is what decides "which adapter".
 
-  * WSL — mode-dependent.  The guest's address follows the host's
-    ``networkingMode`` (``nat``, ``mirrored``, ``consomme``/``virtioproxy``,
-    ``bridged``); it is not necessarily a NAT'd 172.x — with Consomme on a
-    bridged switch the guest can share the host's own LAN address, and a LAN
-    client can then reach :8123 by IP.  The effective mode comes from
-    ``wslinfo --networking-mode`` (WSL 2.0.4+), not ``.wslconfig`` alone.
-    ``mirrored`` is the only mode Microsoft documents as carrying multicast:
-    there the guest shares the host's physical adapter, so this component
-    takes the regular Linux/Windows path and registers both names on HA's
-    shared zeroconf instance.  In every other mode — and whenever the mode
-    cannot be read — announcing has no usable path out (under Consomme raw
-    Ethernet frames become ordinary host sockets), so we announce nothing and
-    ``homeant.py`` asks for the Windows hosts entry instead: the browser that
-    follows the OAuth callback runs on the Windows side, and WSL2 forwards
-    ``127.0.0.1`` to the guest.  Measured 11-08 on a Consomme guest, a forced
-    registration still reached no LAN client and hand-sent multicast reached
-    only the Windows host, never the physical LAN.  The mirrored path is
-    **unverified on real hardware**: this host runs Windows 10, below
-    mirrored's Win11 22H2 requirement, so it needs a mirrored machine before
-    release.
-
 Why the two backends must not overlap: measured on macOS 15.7 — a second
 responder for the same host name is **not** rejected (DNSServiceRegister and
 zeroconf both report success), the A record silently flips to whichever
@@ -112,13 +91,19 @@ import subprocess
 import sys
 
 from homeassistant.components import network
-from homeassistant.components.network.const import MDNS_TARGET_IP, PUBLIC_TARGET_IP
+from homeassistant.components.network.const import MDNS_TARGET_IP
 from homeassistant.const import EVENT_HOMEASSISTANT_STOP
+
+# Own route probe instead of HA's PUBLIC_TARGET_IP (8.8.8.8): UDP connect sends
+# nothing, so any public address works, and sharing the CLI's choice keeps the
+# two route lookups on the same interface.
+ROUTE_PROBE_IP = "223.5.5.5"
 
 if sys.platform != "darwin":
     from homeassistant.components.zeroconf import async_get_async_instance
     from homeassistant.components.zeroconf import DOMAIN as ZEROCONF_DOMAIN
     from homeassistant.setup import async_when_setup_or_start
+    from zeroconf import NonUniqueNameException
     from zeroconf.asyncio import AsyncServiceInfo
 
 _LOGGER = logging.getLogger(__name__)
@@ -132,62 +117,60 @@ SERVICE_TYPE = "_homeant._tcp.local."
 SERVICE_NAME = f"{HOSTNAME}.{SERVICE_TYPE}"
 ALIAS_SERVICE_NAME = f"{ALIAS_HOSTNAME}.{SERVICE_TYPE}"
 
+# The built-in broker, announced on the type every MQTT tool already looks for,
+# so a LAN client can find it the way it finds any other server:
+# `avahi-browse -t _mqtt._tcp`.  Same instance name as the record above — a name
+# only has to be unique inside its own type, and one machine keeping one name
+# makes the two records recognisably the same box.
+MQTT_SERVICE_TYPE = "_mqtt._tcp.local."
+MQTT_SERVICE_NAME = f"{HOSTNAME}.{MQTT_SERVICE_TYPE}"
+# Named here rather than imported from the CLI: this component ships inside HA
+# and is loaded by hass, which knows nothing about homeant.py.  The file sits in
+# the config dir, which is where the CLI writes it.
+MQTT_CONF_NAME = "mqtt.yaml"
+
 # ── macOS: mDNSResponder proxy ───────────────────────────────────────
 # dns-sd -P <Name> <Type> <Domain> <Port> <Host> <IP>
 DNS_SD = "/usr/bin/dns-sd"
 SD_TYPE = "_homeant._tcp"
+SD_MQTT_TYPE = "_mqtt._tcp"
 SD_DOMAIN = "local"
 # Matches the dns-sd children this component starts.  Used to reap orphans left
 # by a hass that died before running its stop handler: a stale child keeps the
 # instance name registered, so the next run would come up as "HomeAnt (2)".
-_STALE_PATTERN = r"dns-sd -P .*_homeant\._tcp"
+# Both types, or a dead run's _mqtt record would outlive the broker it points at.
+#
+# The instance name is part of the pattern, not decoration.  pgrep -f matches the
+# whole command line, so a bare ``_(homeant|mqtt)\._tcp`` also matched every
+# other app announcing an MQTT broker on the same box — and this runs a SIGTERM.
+_STALE_PATTERN = r"dns-sd -P (HomeAnt|homeassistant) _(homeant|mqtt)\._tcp"
+
+
+def _is_own_dns_sd(cmdline: str) -> bool:
+    """True only for a command line this component itself would have started.
+
+    The pattern above is the first filter, not the decision: ``pgrep -f`` also
+    matches a ``tail -f`` on a log that merely quotes our argv, and killing a
+    process we did not start is a bug with no upside.  So the pid's full command
+    line is checked token by token before SIGTERM — argv[0] must be dns-sd, then
+    ``-P``, then an instance and a service type we publish.
+
+    A command line that cannot be read is treated as "not ours": a stale record
+    of ours surviving one more boot is recoverable, killing a stranger is not.
+    """
+    parts = cmdline.split()
+    if len(parts) < 4:
+        return False
+    if Path(parts[0]).name != "dns-sd":
+        return False
+    if parts[1] != "-P":
+        return False
+    if parts[2] not in (HOSTNAME, ALIAS_HOSTNAME):
+        return False
+    return parts[3] in (SD_TYPE, SD_MQTT_TYPE)
 
 # How long dns-sd gets to either fail outright or stay up before we call it good.
 _DNS_SD_SETTLE_SEC = 2.0
-
-
-def _is_wsl() -> bool:
-    """True inside WSL (mirrored guests announce, the others do not).
-
-    Same predicate as homeant.py's is_wsl(): the env var is set by every
-    launcher, the kernel release string is the fallback for a bare `wsl -e`
-    shell that inherited no WSL_* variables.
-    """
-    if os.environ.get("WSL_DISTRO_NAME"):
-        return True
-    try:
-        return "microsoft" in Path("/proc/sys/kernel/osrelease").read_text(
-            encoding="utf-8"
-        ).lower()
-    except OSError:
-        return False
-
-
-def _wsl_networking_mode() -> str:
-    """Effective WSL networking mode, or "" when it cannot be determined.
-
-    ``wslinfo`` ships with the WSL engine (``/usr/bin/wslinfo -> /init``, since
-    2.0.4) and reports the mode that actually took effect; ``.wslconfig`` is
-    only a request and can fall back or be overridden.  ``mirrored`` is the
-    only mode documented to carry multicast onto the LAN.  An unreadable mode
-    is deliberately treated as "not mirrored": homeant.py keeps asking for the
-    Windows hosts entry in that case, so both sides must agree.  Called through
-    the executor to keep this subprocess off HA's event loop.  Keep this
-    identical to homeant.py's _wsl_networking_mode().
-    """
-    try:
-        out = subprocess.run(
-            ["wslinfo", "--networking-mode"],
-            capture_output=True,
-            text=True,
-            timeout=5,
-            check=False,
-        )
-    except (OSError, subprocess.SubprocessError):
-        return ""
-    if out.returncode != 0:
-        return ""
-    return out.stdout.strip().lower()
 
 
 def _announce_address(hostname: str, lan: str) -> str:
@@ -213,6 +196,20 @@ def _announce_address(hostname: str, lan: str) -> str:
     return lan
 
 
+def _mqtt_record_target(lan: str) -> tuple[str, str]:
+    """``(host name, address)`` the broker's SRV record points at.
+
+    The broker is the one service in this file that nobody opens in a browser:
+    every client that uses the record is on another machine, so it has to carry
+    the LAN address and the host name that already carries it.  Building it from
+    ``HOSTNAME`` — which is what this did — inherited the loopback pin that only
+    exists for the Xiaomi OAuth callback, and a client that resolved the record
+    then dialled itself.  One helper because both announce backends (``zeroconf``
+    and ``dns-sd -P``) build it, and a per-site choice is how they drift.
+    """
+    return f"{ALIAS_HOSTNAME}.local.", _announce_address(ALIAS_HOSTNAME, lan)
+
+
 def _is_announcable(ip: str) -> bool:
     """False only for addresses no other machine could ever reach.
 
@@ -236,8 +233,8 @@ def _route_source(target: str) -> str | None:
     transmitting anything; the target need not exist.  This deliberately
     bypasses HA's ``async_get_source_ip``: when its answer is not on an
     *enabled* adapter, that helper substitutes ``all_ipv4s[0]``
-    (``network/__init__.py:85``), and on a machine with WSL/Hyper-V that first
-    address is the virtual switch, not the LAN.
+    (``network/__init__.py:85``), and on a machine with a virtual switch that
+    first address is the switch, not the LAN.
     """
     try:
         with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
@@ -270,13 +267,13 @@ async def _async_pick_address(hass) -> tuple[str | None, list[str]]:
     handed a virtual-switch or tunnel address.  Candidates are every IPv4 on
     every adapter HA knows about, *including* adapters the user has not
     enabled — that flag is a UI setting, not a statement about reachability,
-    and on this machine HA enables only the WSL NAT adapter because its
+    and on a machine with a NAT switch HA enables only that adapter because its
     224.0.0.251 probe lands there.
 
     The preferred address is the source the kernel picks for a public target:
     that interface holds the default route, so its address is on the default
     gateway's own segment.  A UDP connect sends nothing, so a black-holed
-    8.8.8.8 is fine.  Where HA's adapter list spells that segment differently,
+    223.5.5.5 is fine.  Where HA's adapter list spells that segment differently,
     the candidate in the same subnet wins.  The 224.0.0.251 probe covers a box
     with no default route at all (isolated LAN).  Last resort: the kernel's
     answer itself (a local, non-loopback address), then the first candidate.
@@ -294,7 +291,7 @@ async def _async_pick_address(hass) -> tuple[str | None, list[str]]:
 
     ips = [ip for ip, _, _ in candidates]
     preferred: str | None = None
-    for target in (PUBLIC_TARGET_IP, MDNS_TARGET_IP):
+    for target in (ROUTE_PROBE_IP, MDNS_TARGET_IP):
         source = _route_source(target)
         if not source or not _is_announcable(source):
             continue
@@ -308,6 +305,28 @@ async def _async_pick_address(hass) -> tuple[str | None, list[str]]:
 
     return preferred, [f"{ip}={name}" for ip, name, _ in candidates
                        if ip != preferred]
+
+
+async def _async_pid_cmdline(pid: int) -> str | None:
+    """Full command line of ``pid``, or None when it cannot be read.
+
+    macOS has no /proc, and this path only ever runs there (dns-sd is the macOS
+    announcement mechanism), so ``ps`` is the portable answer.
+    """
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "/bin/ps",
+            "-o",
+            "command=",
+            "-p",
+            str(pid),
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+        out, _ = await proc.communicate()
+    except OSError:
+        return None
+    return out.decode("utf-8", "replace").strip() or None
 
 
 async def _async_reap_stale_dns_sd() -> None:
@@ -329,6 +348,12 @@ async def _async_reap_stale_dns_sd() -> None:
         pid = int(token)
         if pid == os.getpid():
             continue
+        cmdline = await _async_pid_cmdline(pid)
+        if cmdline is None or not _is_own_dns_sd(cmdline):
+            # pgrep matched, but the process is not one we started (or not one
+            # we can identify).  Leave it alone.
+            _LOGGER.debug("mDNS: not reaping pid %s (%r)", pid, cmdline)
+            continue
         try:
             os.kill(pid, signal.SIGTERM)
             _LOGGER.debug("mDNS: reaped stale dns-sd pid %s", pid)
@@ -336,22 +361,37 @@ async def _async_reap_stale_dns_sd() -> None:
             pass
 
 
-async def _async_announce_via_mdnsresponder(hass, address: str, port: int) -> None:
-    """Publish both names through mDNSResponder (macOS 15+)."""
+async def _async_announce_via_mdnsresponder(
+    hass, address: str, port: int, mqtt_port: int | None = None
+) -> None:
+    """Publish both names, and the broker when there is one (macOS 15+)."""
     await _async_reap_stale_dns_sd()
 
+    # One instance name can carry two records as long as the service types
+    # differ, and dns-sd -P registers each as its own child — so the broker
+    # rides on the same host record as the name, on its own port.  The broker
+    # keeps the box's instance name but not its host record: that one is pinned
+    # to loopback on a desktop, which no other machine can dial.
+    records = [
+        (HOSTNAME, f"{HOSTNAME}.local", _announce_address(HOSTNAME, address),
+         SD_TYPE, port),
+        (ALIAS_HOSTNAME, f"{ALIAS_HOSTNAME}.local",
+         _announce_address(ALIAS_HOSTNAME, address), SD_TYPE, port),
+    ]
+    if mqtt_port:
+        mqtt_host, mqtt_addr = _mqtt_record_target(address)
+        records.append((HOSTNAME, mqtt_host, mqtt_addr, SD_MQTT_TYPE, mqtt_port))
+
     procs = []
-    for instance in (HOSTNAME, ALIAS_HOSTNAME):
-        host = f"{instance}.local"
-        addr = _announce_address(instance, address)
+    for instance, host, addr, sd_type, rec_port in records:
         try:
             proc = await asyncio.create_subprocess_exec(
                 DNS_SD,
                 "-P",
                 instance,
-                SD_TYPE,
+                sd_type,
                 SD_DOMAIN,
-                str(port),
+                str(rec_port),
                 host,
                 addr,
                 stdout=asyncio.subprocess.DEVNULL,
@@ -360,17 +400,18 @@ async def _async_announce_via_mdnsresponder(hass, address: str, port: int) -> No
         except OSError as err:
             _LOGGER.error("mDNS: cannot start dns-sd for %s: %s", host, err)
             continue
-        procs.append((instance, host, proc, addr))
+        procs.append((instance, host, proc, addr, sd_type, rec_port))
 
     # dns-sd refuses a duplicate name immediately; a rejected registration exits
     # within a second, so a still-running child means the record went live.
     await asyncio.sleep(_DNS_SD_SETTLE_SEC)
 
     live = []
-    for instance, host, proc, addr in procs:
+    for instance, host, proc, addr, sd_type, rec_port in procs:
         if proc.returncode is None:
             live.append(proc)
-            _LOGGER.info("mDNS: %s -> %s:%s (via mDNSResponder)", host, addr, port)
+            _LOGGER.info("mDNS: %s (%s) -> %s:%s (via mDNSResponder)",
+                         host, sd_type, addr, rec_port)
         else:
             _LOGGER.error(
                 "mDNS: dns-sd exited (rc=%s) for %s — name may already be taken",
@@ -393,7 +434,7 @@ async def _async_ensure_announce_interface(aio_zc, address: str) -> None:
     """Make HA's shared zeroconf instance also send on the announced address.
 
     HA builds that instance from its enabled-adapter list; on Windows a
-    224.0.0.251 source probe can mark only a WSL/Hyper-V NAT adapter, so the
+    224.0.0.251 source probe can mark only a NAT adapter, so the
     physical LAN adapter never gets a socket and the A record we register is
     never announced where another machine can hear it.  ``interfaces`` takes
     IP addresses, not adapter names — zeroconf resolves each one to its
@@ -422,31 +463,126 @@ async def _async_ensure_announce_interface(aio_zc, address: str) -> None:
     _LOGGER.info("mDNS: announce interface added %s", address)
 
 
+def _mqtt_broker_port(hass) -> int | None:
+    """Port of the built-in broker, or None when there is no broker to point at.
+
+    Read from the YAML the CLI generates for the broker instead of parsing cfg
+    again: that file is what the broker was actually started with, so the
+    announcement cannot drift from the listener.  A missing or unreadable file
+    means "do not advertise" — a record naming a port nobody serves is worse
+    than no record at all, because the client that finds it believes it.
+    """
+    try:
+        text = (Path(hass.config.config_dir) / MQTT_CONF_NAME).read_text(
+            encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+    # One `bind: <host>:<port>` line, written by this product — not arbitrary
+    # YAML, so a hand parse is the honest amount of parsing to do here.
+    for line in text.splitlines():
+        entry = line.strip()
+        if not entry.startswith("bind:"):
+            continue
+        host_port = entry[len("bind:"):].strip()
+        if ":" not in host_port:
+            return None
+        try:
+            port = int(host_port.rsplit(":", 1)[1])
+        except ValueError:
+            return None
+        return port if 0 < port < 65536 else None
+    return None
+
+
+# ── announcing: conflicts and the retry ladder ───────────────────────
+# A name can legitimately be taken on this network: someone started a second
+# HomeAnt, or a stopped box's records are still cached elsewhere (A record TTL
+# is 120 s).  The answer is bounded — three attempts over 3.5 minutes, which
+# outlives that cache but does not fight a real second instance.
+_REGISTER_RETRY_DELAYS = (30, 60, 120)
+
+
+async def _async_register_infos(aio_zc, infos, announced=None, *, quiet=False):
+    """Announce every record not announced yet; return ``(conflicts, names)``.
+
+    ``NonUniqueNameException`` gets one line, not a traceback: on a network
+    with a second HomeAnt it is the *expected* answer, and three tracebacks
+    per start read like a crash in a log the user checks by eye.  Everything
+    else keeps the stack — those are the ones worth debugging.
+
+    ``quiet`` drops the conflict line to DEBUG for the retry passes: the first
+    pass already said it, and repeating it per attempt turns three lines into
+    nine.
+    """
+    announced = set() if announced is None else announced
+    conflicts = []
+    for info in infos:
+        if info.name in announced:
+            continue
+        try:
+            await aio_zc.async_register_service(info, strict=False)
+        except NonUniqueNameException:
+            conflicts.append(info)
+            if quiet:
+                _LOGGER.debug("mDNS: %s is still held", info.server)
+            else:
+                _LOGGER.warning(
+                    "mDNS: %s is already announced on this network — another "
+                    "HomeAnt instance, or the records a stopped one left "
+                    "behind, holds the name; retrying in the background",
+                    info.server,
+                )
+            continue
+        except Exception:  # pragma: no cover - depends on the backend
+            _LOGGER.exception("mDNS register failed for %s", info.server)
+            continue
+        announced.add(info.name)
+        _LOGGER.info(
+            "mDNS: %s -> %s:%s",
+            info.server,
+            ", ".join(info.parsed_addresses()),
+            # The record's own port.  This said `port` — the web port, still in
+            # scope — so the broker's line printed 8123 and read like a correct
+            # announcement.
+            info.port,
+        )
+    return conflicts, announced
+
+
+async def _async_retry_until_announced(hass, aio_zc, infos, announced):
+    """Retry the records a neighbour holds; give up loudly, never silently."""
+    for delay in _REGISTER_RETRY_DELAYS:
+        await asyncio.sleep(delay)
+        if getattr(hass, "is_stopping", False):
+            return
+        # The verdict is `announced`, not the conflicts this pass returned: a
+        # retry can fail for a reason that is not a name clash (backend error
+        # after the neighbour left), which leaves the conflict list empty while
+        # the records are still off the wire.  Reading success off that list
+        # printed "every record is announced" over silence.
+        _, announced = await _async_register_infos(
+            aio_zc, infos, announced, quiet=True)
+        pending = [info for info in infos if info.name not in announced]
+        if not pending:
+            _LOGGER.info("mDNS: every record is announced after the retry")
+            return
+    _LOGGER.warning(
+        "mDNS: %d record(s) still held after %d s — they stay unannounced "
+        "until this box restarts. Stop the other HomeAnt on this network, "
+        "then run 'homeant stop' and 'homeant start'",
+        len(pending),
+        sum(_REGISTER_RETRY_DELAYS),
+    )
+
+
 async def async_setup(hass, config):
     """Set up homeant_mdns."""
-    if _is_wsl():
-        mode = await hass.async_add_executor_job(_wsl_networking_mode)
-        if mode != "mirrored":
-            # Non-mirrored (or unreadable) WSL: the Windows hosts entry is the
-            # only path that works — see the module docstring.  Announcing here
-            # would add an unreachable record.
-            _LOGGER.info(
-                "mDNS: no announce in WSL (mode=%s) — homeassistant.local / "
-                "HomeAnt.local resolve through the Windows hosts entry, not "
-                "through mDNS", mode or "unknown",
-            )
-            return True
-        # mirrored shares the host's physical adapter: fall through and use
-        # the regular Linux/Windows backend.  Unverified on real hardware —
-        # see the module docstring.
-        _LOGGER.info("mDNS: WSL mirrored mode — announcing via HA zeroconf")
-
     address, others = await _async_pick_address(hass)
     if address is None:
         _LOGGER.warning(
             "No IPv4 address to announce — .local names will not resolve via mDNS",
         )
-        return True  # not fatal; the WSL hosts entry still works
+        return True  # not fatal: everything else works without mDNS
     if others:
         _LOGGER.debug(
             "mDNS: announcing %s only — other interfaces not announced: %s",
@@ -459,8 +595,12 @@ async def async_setup(hass, config):
     except Exception:
         port = 8123
 
+    # None when no broker is configured: nothing is announced for it then.
+    # In the executor: the helper reads mqtt.yaml off the event loop.
+    mqtt_port = await hass.async_add_executor_job(_mqtt_broker_port, hass)
+
     if sys.platform == "darwin":
-        await _async_announce_via_mdnsresponder(hass, address, port)
+        await _async_announce_via_mdnsresponder(hass, address, port, mqtt_port)
         return True
 
     infos = [
@@ -479,22 +619,35 @@ async def async_setup(hass, config):
             port=port,
         ),
     ]
+    if mqtt_port:
+        # A different service type and its own port, but the *alias* host
+        # record: the address is the machine as another device sees it, and the
+        # name is the one that already carries that address.  ``HOSTNAME`` here
+        # would announce 127.0.0.1 on a desktop (see ``_mqtt_record_target``).
+        mqtt_host, mqtt_addr = _mqtt_record_target(address)
+        infos.append(
+            AsyncServiceInfo(
+                MQTT_SERVICE_TYPE,
+                name=MQTT_SERVICE_NAME,
+                server=mqtt_host,
+                parsed_addresses=[mqtt_addr],
+                port=mqtt_port,
+            )
+        )
 
     async def _when_zeroconf_ready(hass_, component):
         """Register as soon as HA's zeroconf creates the shared instance."""
         aio_zc = await async_get_async_instance(hass_)
         await _async_ensure_announce_interface(aio_zc, address)
-        for info in infos:
-            try:
-                await aio_zc.async_register_service(info, strict=False)
-            except Exception:  # pragma: no cover
-                _LOGGER.exception("mDNS register failed for %s", info.server)
-                continue
-            _LOGGER.info(
-                "mDNS: %s -> %s:%s",
-                info.server,
-                ", ".join(info.parsed_addresses()),
-                port,
+        conflicts, announced = await _async_register_infos(aio_zc, infos)
+        if conflicts:
+            # Bounded retries in the background.  A name another instance holds
+            # usually frees up by itself — that instance is stopped, or the
+            # records it left behind expire — and a record that stays
+            # unannounced is invisible from the LAN until this box restarts.
+            hass_.async_create_task(
+                _async_retry_until_announced(hass_, aio_zc, infos, announced),
+                "homeant_mdns announce retry",
             )
 
     # Hook into zeroconf's init — guaranteed AFTER HA owns the socket.

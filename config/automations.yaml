@@ -10,8 +10,12 @@
 #       选择记在 input_text.homeant_voice_speaker，本自动化补完选项后写回下拉
 #       （input_select 的 options 是运行时才补的，靠它自己恢复会被打回 unset）
 #
-# 触发：HA 启动 + 音箱列表变化（template trigger 比较渲染值，增删成员都会触发；
-#       本仓 HA 的 state trigger 不支持 domain 通配，故用 template）
+# 触发：HA 启动 + 音箱列表变化。template trigger 只接受布尔结果（经
+#       result_as_boolean 判定，非布尔一律视为 false），并且只认 false→true
+#       的跳变，所以这里比的是「发现的集合 != 选项里的集合」，而不是把列表
+#       直接渲染出来：后者恒为 false，永远不触发。set_options 把同一集合写回
+#       之后比较回落为 false，下次增删才能再跳变一次。
+#       （本仓 HA 的 state trigger 不支持 domain 通配，故用 template）
 # ⚠️ 不写死任何 entity_id / did —— 全靠模板运行时发现，换机换音箱零维护
 # =============================================================================
 - id: homeant_voice_discover_speakers
@@ -20,7 +24,7 @@
     - platform: homeassistant
       event: start
     - platform: template
-      value_template: "{{ states.notify | map(attribute='entity_id') | select('search', '_play_text_a_') | list }}"
+      value_template: "{{ (states.notify | map(attribute='entity_id') | select('search', '_play_text_a_') | list) != (state_attr('input_select.homeant_voice_speaker', 'options') | reject('eq', 'unset') | list) }}"
   action:
     - variables:
         speakers: >-

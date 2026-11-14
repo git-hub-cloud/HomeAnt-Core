@@ -1,25 +1,33 @@
 #!/usr/bin/env python3
 """dist-pack.py - HomeAnt one-click packager
 
-Reads version from pyproject.toml and produces two kinds of artifact:
+Reads version from pyproject.toml and produces three kinds of artifact:
 
-  dist/HomeAnt-{version}.zip   source package, unpacked by the installer
-                                    and consumed by `homeant start`
-  dist/install.ps1 / install.sh     online installers, stamped with the version
-                                    and uploaded to the release host
+  dist/HomeAnt-{version}-{tag}.zip  source package, unpacked by the installer
+                                    and consumed by `homeant start`.  `{tag}` is
+                                    the first 8 hex of the archive's own sha256,
+                                    so two builds of one version can coexist on
+                                    the release host instead of overwriting.
+  dist/install.sh / install.ps1     online installers, stamped with the version
+                                    and the zip digest, uploaded to the release
+                                    host under their fixed names
+  dist/install-{version}-{tag}.{sh,ps1}
+                                    the same bytes under an immutable name, so a
+                                    release can be pinned and audited even after
+                                    the fixed entry point moves on
 
 The installers are NOT packed into the zip. install.* is the online entry point
 fetched straight from the release host; the zip is the source package for
 local use
 (`./homeant start`). Nothing inside the zip ever runs install.*.
 
-Before any of that, six contracts shared with install.sh / install.ps1 /
+Before any of that, seven contracts shared with install.sh / install.ps1 /
 homeant.py are compared, and packing is refused when they disagree — see
 check_drift(). The installer trio cannot be exercised from here, so it is
-checked instead: the download path, the archive name, the temp-file name, the
-flag name, the version-stamp variable and the `start` invocation are exactly
-the things that break silently when one file is edited and its siblings are
-not.
+checked instead: the download path, the archive name, the digest-prefix width
+cut inside each installer, the temp-file name, the flag name, the version-stamp
+variable and the `start` invocation are exactly the things that break silently
+when one file is edited and its siblings are not.
 
 Before packing, four things are reconciled in ONE run — never two invocations:
 
@@ -45,15 +53,28 @@ Before packing, four things are reconciled in ONE run — never two invocations:
                    output; a stale zip carrying the same version number is
                    otherwise indistinguishable from a fresh one.
 
+The zip itself is a function of the tree, not of the machine that packed it:
+timestamps come from SOURCE_DATE_EPOCH — defaulting to the last commit's epoch,
+and a tree with no commit is refused — entries are sorted, and mode bits are
+written explicitly. Same sources ⇒ same bytes ⇒ same digest ⇒ same file name,
+whether the tree was cloned today or last month, on Windows or on Linux.
+See entry_epoch().
+
 Usage:
     python scripts/dist-pack.py      # no arguments
+
+    # to date the build by something other than HEAD:
+    SOURCE_DATE_EPOCH=315532800 python scripts/dist-pack.py
 """
 from __future__ import annotations
 
+import hashlib
+import os
 import re
 import shutil
 import subprocess
 import sys
+import time
 import zipfile
 from pathlib import Path
 
@@ -65,6 +86,54 @@ STAMP_INSTALL_SCRIPTS = ["scripts/install.ps1", "scripts/install.sh"]
 # The literal both installers carry until this packager replaces it. Named once
 # so the stamp and the drift check cannot disagree about what to look for.
 VERSION_PLACEHOLDER = "__HOMEANT_VERSION_PLACEHOLDER__"
+
+# Same idea for the digest of the zip these installers download. Stamped after
+# the zip is final, never fetched at install time: a digest that travels inside
+# the script cannot be replaced on the CDN independently of the zip, so the pair
+# can never agree on the wrong bytes. The installers treat an unstamped literal
+# as "could not check", never as a match — see their digest helpers.
+ZIP_SHA256_PLACEHOLDER = "__HOMEANT_ZIP_SHA256_PLACEHOLDER__"
+
+# The release file is NAMED after its own digest: `HomeAnt-<version>-<tag>.zip`.
+# Two consequences, both wanted.  The URL is immutable - repacking one version
+# publishes a different file instead of replacing one, so no CDN entry can hand
+# yesterday's bytes to a client asking for today's - and the operator can tell
+# two builds of one version apart without opening either.
+#
+# TAG_LEN = 8 hex = 32 bits, which is plenty for the number of builds one
+# project will ever publish.  It stays 8 rather than 64 because the name is an
+# identifier, not the check: the installers compare the downloaded bytes against
+# the full 64 hex stamped into them, so the short form can be wrong in a URL and
+# the download still stops at the checksum.  Keep it equal to `cut -c1-N` in
+# install.sh and `Substring(0, N)` in install.ps1 - check_drift() refuses to
+# pack when they disagree, because one hex char of difference 404s a platform.
+TAG_LEN = 8
+ARC_NAME = "HomeAnt-{version}-{tag}.zip"
+
+
+def arc_name(version: str, digest: str) -> str:
+    """Release file name for ``version``, tagged with ``digest``'s prefix."""
+    return ARC_NAME.format(version=version, tag=digest[:TAG_LEN])
+
+
+# The installers get the same treatment as the zip: the fixed name
+# (`install.sh`) is the entry point documentation and `curl | sh` point at, and
+# it has to keep moving; the versioned copy (`install-0.1.1-588ba06a.sh`) is the
+# immutable record of what that release actually shipped.  Same bytes, two names
+# — because "the installer changed" is the one failure the digest inside it
+# cannot report: the script holding the checksum is exactly the script you would
+# have to trust.
+#
+# `{tag}` is the same 8 hex as the zip in the same release (one `digest[:TAG_LEN]`
+# feeds both), so a versioned installer pairs with the archive it installs by
+# name, and a stale download is visible without opening either file.
+VERSIONED_INSTALL = "install-{version}-{tag}{suffix}"
+
+
+def versioned_name(version: str, digest: str, suffix: str) -> str:
+    """Immutable copy name for ``version``, tagged like the zip."""
+    return VERSIONED_INSTALL.format(
+        version=version, tag=digest[:TAG_LEN], suffix=suffix)
 
 # ---- what to include in the zip ----
 INCLUDE_PATHS = [
@@ -265,6 +334,7 @@ def check_drift(repo_root: Path, version: str) -> list[str]:
     sh = (repo_root / "scripts/install.sh").read_text(encoding="utf-8")
     ps1 = (repo_root / "scripts/install.ps1").read_text(encoding="utf-8")
     py = (repo_root / "scripts/homeant.py").read_text(encoding="utf-8")
+    pyproject = (repo_root / "pyproject.toml").read_text(encoding="utf-8")
     problems: list[str] = []
 
     def grab(text: str, pattern: str, what: str) -> str | None:
@@ -284,8 +354,11 @@ def check_drift(repo_root: Path, version: str) -> list[str]:
             f"        install.ps1 {_shape(ps1_url)}"
         )
     # ... and it must be the name this packager actually writes, or the upload
-    # set is internally consistent but points at a file that never exists
-    produced = "HomeAnt-{}.zip"
+    # set is internally consistent but points at a file that never exists.  Both
+    # interpolations collapse to {} under _shape, so this compares the literal
+    # parts around them — version separator, tag separator, extension — and
+    # nothing else.
+    produced = ARC_NAME.format(version="{}", tag="{}")
     for label, url in (("install.sh", sh_url), ("install.ps1", ps1_url)):
         if url:
             fetched = _shape(url).rsplit("/", 1)[-1]
@@ -293,6 +366,34 @@ def check_drift(repo_root: Path, version: str) -> list[str]:
                 problems.append(
                     f"{label}: fetches {fetched!r}, but this packager writes {produced!r}"
                 )
+
+    # 1b. the tag is cut by each installer and appended by this packager.  One
+    #     hex char of disagreement is not cosmetic: the URL names a file and the
+    #     host holds exactly one name per build, so the platform that cuts the
+    #     wrong width 404s — on a user's machine, during an install, with a
+    #     download error that says nothing about digests.  Nothing runs an
+    #     installer at pack time, so this static comparison is the only place it
+    #     can be caught.
+    widths: dict[str, str] = {}
+    for label, text, pattern in (
+        ("install.sh", sh, r"(?m)^ZIP_TAG=.*cut -c1-(\d+)"),
+        ("install.ps1", ps1, r"\$HOMEANT_ZIP_SHA256\.Substring\(0,\s*(\d+)\)"),
+    ):
+        m = re.search(pattern, text)
+        if not m:
+            problems.append(
+                f"{label}: no digest-prefix width (`cut -c1-N` / `Substring(0, N)`)"
+                f" — this checker is stale, update its pattern"
+            )
+        else:
+            widths[label] = m.group(1)
+    wrong = {k: v for k, v in widths.items() if v != str(TAG_LEN)}
+    if wrong:
+        problems.append(
+            "release-name tag width differs: "
+            + ", ".join(f"{k} cuts {v} hex" for k, v in sorted(wrong.items()))
+            + f", this packager appends {TAG_LEN} — those URLs point at no file"
+        )
 
     # 2. the temp file each installer downloads into. Same shape on both sides,
     #    and install.ps1 agrees with itself — it downloads in two places (main
@@ -317,51 +418,66 @@ def check_drift(repo_root: Path, version: str) -> list[str]:
                 f"        install.ps1 {ps1_name}"
             )
 
-    # 3. how each installer finishes: `start --no-install`, that flag and no
+    # 3. how each installer finishes: `start --no-upgrade`, that flag and no
     #    other. The py side of the contract is check 4.
     for label, text, call in (
-        ("install.sh", sh, "./homeant start --no-install"),
-        ("install.ps1", ps1, ".\\homeant start --no-install"),
+        ("install.sh", sh, "./homeant start --no-upgrade"),
+        ("install.ps1", ps1, ".\\homeant start --no-upgrade"),
     ):
         if call not in text:
             problems.append(f"{label}: does not finish with `{call}`")
         # any other spelling means the two sides drifted, and a missing
-        # --no-install reopens the py -> installer -> py loop
+        # --no-upgrade reopens the py -> installer -> py loop
         for m in re.finditer(r"homeant start ([-\w ]+)", text):
-            if m.group(1).strip() != "--no-install":
+            if m.group(1).strip() != "--no-upgrade":
                 problems.append(
                     f"{label}: finishes with `homeant start "
-                    f"{m.group(1).strip()}` — the only flag is --no-install")
+                    f"{m.group(1).strip()}` — the only flag is --no-upgrade")
 
     # 4. the py side of that contract: `start` is the single entry point, so the
-    #    only flags it may register are the two store_true switches its callers
-    #    set. A value flag would arrive as the string "false" — true in Python —
-    #    and the switch would silently do nothing. `init` must not come back
-    #    either: setup happens inside `start`, so a second entry point would
-    #    drift.
+    #    only switches it may register are the ones its callers set. A value
+    #    flag would arrive as the string "false" — true in Python — and the
+    #    switch would silently do nothing. `init` must not come back either:
+    #    setup happens inside `start`, so a second entry point would drift.
     #
-    #    `--foreground` joined in T5 as the supervisor contract (the unit's
-    #    ExecStart, and the docker/terminal case) and `--service-host` in T9 as
-    #    the Windows SCM entry point; before that this check said "exactly one
-    #    flag".  All three are switches, never values — the list pins the kind
-    #    as well as the names, so a fourth flag has to be argued for here
-    #    instead of slipping in.
-    start_flags = re.findall(
+    #    `--foreground` is the supervisor contract (the unit's ExecStart,
+    #    and the docker/terminal case); `--service-host` is the Windows
+    #    SCM entry point.  Both are added straight on the parser.
+    #
+    #    The upgrade pair is different in kind: the two override the
+    #    default in opposite directions, so they live in a mutually exclusive
+    #    group and argparse — not the order of the `if`s in cmd_start — decides
+    #    what a mixed command line means. The pair is named after the install,
+    #    not the network: --no-upgrade is the installer's own tail, --reinstall
+    #    is the user's override, and the default (probe the release host) needs
+    #    no spelling at all.
+    #    Registered through the group only; a fourth direct switch still has to
+    #    be argued for here instead of slipping in.
+    if "p_start.add_mutually_exclusive_group()" not in py:
+        problems.append(
+            "homeant.py: the upgrade switches are no longer a mutually "
+            "exclusive group — `--no-upgrade --reinstall` would need an "
+            "unwritten precedence rule"
+        )
+    direct = re.findall(
         r"p_start\.add_argument\(\s*\"(--[a-z-]+)\"\s*,\s*action=\"store_true\"",
         py,
     )
-    if sorted(start_flags) != ["--foreground", "--no-install", "--service-host"]:
+    if sorted(direct) != ["--foreground", "--service-host"]:
         problems.append(
-            "homeant.py: `start` registers exactly three store_true switches — "
-            f"--no-install, --foreground and --service-host "
-            f"(found: {start_flags or 'none'})"
+            "homeant.py: `start` takes exactly two direct store_true switches — "
+            f"--foreground and --service-host (found: {direct or 'none'})"
         )
-    m = re.search(r"p_start\.add_argument\((.*?)\n\s*p_start\.set_defaults", py, re.S)
-    body = m.group(1) if m else ""
-    if '"--no-install"' not in body or 'action="store_true"' not in body:
+    grouped = re.findall(
+        r"net\.add_argument\(\s*\"(--[a-z-]+)\"\s*,\s*action=\"store_true\"",
+        py,
+    )
+    if sorted(grouped) != ["--no-upgrade", "--reinstall"]:
         problems.append(
-            'homeant.py: `--no-install` must be store_true — passed as a '
-            'value it reads as the string "false", which is truthy'
+            "homeant.py: the mutually exclusive group registers exactly "
+            "--no-upgrade and --reinstall, both store_true "
+            f"(found: {grouped or 'none'} — this checker reads `net.`; if the "
+            "group was renamed, update its pattern too)"
         )
     if re.search(r'add_parser\(\s*"init"', py):
         problems.append(
@@ -369,9 +485,15 @@ def check_drift(repo_root: Path, version: str) -> list[str]:
         )
 
     # 5. the upgrade handshake. py dispatches with --upgrade and both installers
-    #    compare against that exact literal; py has two dispatch branches
-    #    (Windows / unix) and losing one means a platform drops the flag.
-    if not re.search(r'"--upgrade"\s*\]', sh):
+    #    take that exact literal; py has two dispatch branches (Windows / unix)
+    #    and losing one means a platform drops the flag.
+    #
+    #    A comparison, not a grammar. Neither script ever lands on disk (one is
+    #    piped into `sh -s --`, the other is parsed in memory), so the only
+    #    argv they see is the one homeant builds - a usage screen would be a
+    #    promise to a caller that does not exist. What must not regress is the
+    #    flag being recognised.
+    if not re.search(r'\[\s*"\$_a"\s*=\s*"--upgrade"\s*\]', sh):
         problems.append('install.sh: no `[ "$_a" = "--upgrade" ]` comparison')
     if not re.search(r"-eq\s+'--upgrade'", ps1):
         problems.append("install.ps1: no `-eq '--upgrade'` comparison")
@@ -414,6 +536,111 @@ def check_drift(repo_root: Path, version: str) -> list[str]:
                     f"{label}: py's VERSION_RE does not match the line this build "
                     f"would stamp ({sample}) — a release would read as having no version"
                 )
+
+    # 7. the uv release, spelled out in four places: the lock's pin, one line
+    #    per installer, and — the only one a script cannot state — a directory
+    #    on the CDN. A bump that misses a side either fetches a uv nobody
+    #    uploaded (a 404 in the middle of an install) or leaves the tree
+    #    claiming two versions at once. `uv/<ver>/` is checked here because that
+    #    directory is the only record of "this release was prepared for upload".
+    uv_versions = {
+        label: value
+        for label, value in (
+            ("pyproject.toml", grab(pyproject, r'(?m)^\s*"uv==([^"]+)"',
+                                    "pyproject.toml uv==")),
+            ("install.sh", grab(sh, r'(?m)^UV_VERSION="([^"]+)"',
+                                "install.sh UV_VERSION")),
+            ("install.ps1", grab(ps1, r'(?m)^\$UvVersion\s*=\s*"([^"]+)"',
+                                 "install.ps1 $UvVersion")),
+        )
+        if value
+    }
+    if len(set(uv_versions.values())) > 1:
+        problems.append(
+            "uv version differs: "
+            + ", ".join(f"{k}={v}" for k, v in uv_versions.items())
+        )
+    elif uv_versions:
+        pinned = next(iter(uv_versions.values()))
+        if not (repo_root / "uv" / pinned).is_dir():
+            problems.append(
+                f"uv/{pinned}/ does not exist — both installers would fetch "
+                f"uv {pinned} from a CDN directory this tree never prepares"
+            )
+
+    # 8. the digest literal in the source tree is a placeholder and nothing
+    #    else. dist/ holds the stamped copy; scripts/ is what the next release
+    #    will stamp. A real digest left here means someone edited the tree
+    #    after packing, and the next release would ship a checksum describing
+    #    the previous zip — caught before unpacking on a user's machine, but
+    #    only if it never leaves this check.
+    for label, value in (
+        ("install.sh", grab(sh, r'(?m)^HOMEANT_ZIP_SHA256="([^"]*)"',
+                            "install.sh HOMEANT_ZIP_SHA256")),
+        ("install.ps1", grab(ps1, r'(?m)^\$HOMEANT_ZIP_SHA256\s*=\s*"([^"]*)"',
+                             "install.ps1 $HOMEANT_ZIP_SHA256")),
+    ):
+        if value is not None and value != ZIP_SHA256_PLACEHOLDER:
+            problems.append(
+                f"{label}: digest constant is {value!r}, but the source tree "
+                f"must carry {ZIP_SHA256_PLACEHOLDER} — stamping happens in "
+                f"dist/, so any other value here ships a stale checksum"
+            )
+
+    # 9. the preflight port list, which exists twice and says so in both
+    #    comments. Labels may differ (they are prose); the port set may not: a
+    #    port checked on one platform and not the other is a green install
+    #    followed by a service that cannot bind.
+    sh_ports = grab(sh, r'(?m)^PREFLIGHT_PORTS="([^"]*)"',
+                    "install.sh PREFLIGHT_PORTS")
+    ps1_ports = re.findall(
+        r'@\{\s*Port\s*=\s*(\d+)\s*;\s*Label\s*=\s*"[^"]*"\s*\}', ps1
+    )
+    if not ps1_ports:
+        problems.append(
+            "install.ps1 $PreflightPorts: no `@{ Port = 8123; Label = \"…\" }` "
+            "entries — this checker is stale, update its pattern"
+        )
+    elif sh_ports is not None:
+        # One entry per LINE, not per word: preflight() splits on a literal
+        # newline precisely so a label may contain spaces, so splitting on
+        # whitespace here would invent ports out of "Home Assistant HTTP".
+        sh_set = {
+            entry.split("|", 1)[0].strip()
+            for entry in sh_ports.splitlines()
+            if entry.strip()
+        }
+        ps1_set = set(ps1_ports)
+        if sh_set != ps1_set:
+            problems.append(
+                "preflight port lists differ:\n"
+                f"        install.sh  {sorted(sh_set)}\n"
+                f"        install.ps1 {sorted(ps1_set)}"
+            )
+
+    # 10. the source-tree guard. A checkout must be handed to its own installer
+    #     copy: the released one cannot tell a checkout from an unpacked release
+    #     (both are "a HomeAnt tree with a version") and would unpack the zip
+    #     over work that exists nowhere else. Both halves are load-bearing —
+    #     `.git` is the discriminator (a release zip has none), `_local_installer`
+    #     is the decision.
+    if "_local_installer()" not in py or '".git"' not in py:
+        problems.append(
+            "homeant.py: the source-tree guard is gone — a checkout would be "
+            "handed to the released installer, which unpacks over it "
+            "(`_local_installer()` + the `.git` discriminator)"
+        )
+
+    # 11. one help screen. Every command is registered through `add(...)` with
+    #     `add_help=False`; a second `sub.add_parser(` call brings back a page
+    #     that only restates one line, and `homeant status --help` stops
+    #     matching `homeant --help`.
+    if "add_help=False" not in py or py.count("sub.add_parser(") != 1:
+        problems.append(
+            "homeant.py: subcommands no longer share one help screen — "
+            "register them through `add(...)` with add_help=False "
+            f"(sub.add_parser( found {py.count('sub.add_parser(')}x, want 1)"
+        )
 
     return problems
 
@@ -492,10 +719,105 @@ def should_exclude(path: Path, root: Path) -> bool:
     return False
 
 
-# the entry script must keep the executable bit inside the zip —
-# zipfile.write() stores the on-disk mode, which has no +x when
-# packing on Windows (MSVCRT stat), breaking ./homeant for
-# Linux/macOS users after unzip.
+# ── a zip that depends on the tree and nothing else ─────────────────────────
+#
+# A zip entry carries a DOS date/time — two bytes of date, two of time — and
+# that field has no timezone at all.  The value is a wall clock, so whoever
+# extracts it has to guess: Windows reads it as local time, Linux unzip reads it
+# as UTC.  Neither is wrong; the field simply cannot say "this instant".
+#
+# `zf.write()` fills it from each source file's mtime, which makes the whole
+# archive a function of when the tree was checked out: the same commit cloned
+# twice packs into two different zips, with two different names, and nothing to
+# compare them by.  So this packer writes the timestamps itself, from one input:
+#
+#     SOURCE_DATE_EPOCH   epoch of the build, per reproducible-builds.  Unset,
+#                         the epoch of the last commit is used — the same value
+#                         `SOURCE_DATE_EPOCH=$(git log -1 --format=%ct)` gives
+#                         by hand, so the default already reproduces
+#
+# `time.gmtime` is deliberate.  It ignores TZ, so a pack on a +08:00 laptop and
+# on a UTC server write the same numbers.  `time.localtime` — what CPython's own
+# SOURCE_DATE_EPOCH support uses — does not, which is why this is computed here
+# rather than delegated to `zipfile`.
+#
+# Only those four bytes would be a half-fix.  Two more things leak the machine
+# into the archive, and both are pinned below: entry order (the filesystem's,
+# not the tree's — NTFS and ext4 disagree) and the mode bits (`zf.write()` takes
+# them from the on-disk file, so 0644 under one umask and 0664 under another).
+_ZIP_EPOCH_FLOOR = 315532800  # 1980-01-01T00:00:00Z, the earliest DOS date
+_COMPRESS_LEVEL = 6
+
+
+def _git_stamp(repo_root: Path) -> tuple[int, str] | None:
+    """``(epoch, label)`` for HEAD, or None when there is no commit to ask.
+
+    ``%ct`` is an epoch, not a formatted date: the committer's ``+08:00`` offset
+    never reaches the archive.  That is the whole point — a formatted date would
+    carry the offset, and two machines would disagree again.
+    """
+    try:
+        proc = subprocess.run(
+            ["git", "-C", str(repo_root), "log", "-1", "--format=%ct %h"],
+            capture_output=True, text=True, timeout=15,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if proc.returncode != 0:
+        return None
+    parts = proc.stdout.split()
+    if not parts:
+        return None
+    try:
+        epoch = int(parts[0])
+    except ValueError:
+        return None
+    short = parts[1] if len(parts) > 1 else "?"
+    return epoch, f"last commit {short} (git log -1 --format=%ct)"
+
+
+def entry_epoch(repo_root: Path) -> tuple[int, str]:
+    """``(epoch, where it came from)`` for every entry's timestamp.
+
+    ``SOURCE_DATE_EPOCH`` wins when set; otherwise the last commit decides, so a
+    plain `python scripts/dist-pack.py` reproduces without the caller having to
+    remember anything.
+
+    A tree with no commit — not a repo, no Git installed, nothing committed yet
+    — is refused rather than stamped with a made-up date: the archive would
+    still install, but its name would claim a build time nobody chose, and the
+    fix is one line.
+
+    A value below the floor is clamped, not rejected: ``SOURCE_DATE_EPOCH=0`` is
+    a legitimate way to say "as early as the format allows", while CPython's own
+    support turns it into a ``struct.error``.
+    """
+    raw = os.environ.get("SOURCE_DATE_EPOCH", "").strip()
+    if raw:
+        try:
+            epoch = int(raw)
+        except ValueError:
+            sys.exit(f"ERROR: SOURCE_DATE_EPOCH={raw!r} is not an epoch")
+        if epoch < _ZIP_EPOCH_FLOOR:
+            return _ZIP_EPOCH_FLOOR, f"SOURCE_DATE_EPOCH={epoch} clamped to 1980-01-01Z"
+        return epoch, f"SOURCE_DATE_EPOCH={epoch}"
+
+    found = _git_stamp(repo_root)
+    if found is None:
+        sys.exit(
+            "ERROR: no commit to date this build by, and SOURCE_DATE_EPOCH is unset.\n"
+            "       Pack a git checkout, or name the epoch yourself:\n"
+            "         SOURCE_DATE_EPOCH=<epoch> python scripts/dist-pack.py"
+        )
+    epoch, label = found
+    if epoch < _ZIP_EPOCH_FLOOR:
+        return _ZIP_EPOCH_FLOOR, f"{label} — clamped to 1980-01-01Z"
+    return epoch, label
+
+
+# the entry script must keep the executable bit inside the zip — the mode bits
+# are written explicitly now (see make_zip), and on Windows the on-disk file has
+# no +x to copy, which would break ./homeant for Linux/macOS users after unzip.
 EXEC_ARCS = {"homeant"}
 
 
@@ -513,6 +835,12 @@ def collect_files(repo_root: Path) -> list[tuple[Path, str]]:
     Every arc stays relative to the repo root — never relative to the included
     dir's parent — which is what keeps core/, vendor/ha_xiaomi_home/custom_-
     components/, config/ and script/ exactly where the consumers resolve them.
+
+    Sorted by arcname before returning, because `rglob` yields whatever order
+    the filesystem hands back and NTFS and ext4 do not agree.  The archive has
+    to be a function of the tree, so its entry order has to come from the tree
+    too — otherwise two machines pack the same sources into different bytes for
+    no reason anyone could act on.
     """
     files: list[tuple[Path, str]] = []
 
@@ -531,48 +859,89 @@ def collect_files(repo_root: Path) -> list[tuple[Path, str]]:
                 if should_exclude(f, repo_root):
                     continue
                 files.append((f, f.relative_to(repo_root).as_posix()))
+
+    files.sort(key=lambda pair: pair[1])
     return files
 
 
 def stamp_install_scripts(
-    repo_root: Path, version: str, out_dir: Path
-) -> list[str]:
+    repo_root: Path, version: str, out_dir: Path, zip_sha256: str
+) -> tuple[list[str], list[str]]:
     """
-    Stamp install.ps1 / install.sh with the real version and write them to
-    out_dir for upload. They are never added to the zip.
+    Stamp install.ps1 / install.sh with the real version and the digest of the
+    zip, then write them to out_dir for upload. They are never added to the zip,
+    and that is exactly what lets the digest be stamped here: the bytes it
+    describes are already final, so this step cannot invalidate them.
 
-    Global replace is safe because the placeholder literal appears ONLY on the
+    Each script is written twice — under its fixed name and under an immutable
+    `install-{version}-{tag}` name. The bytes are identical by construction (one
+    string, two paths), which is the point: the fixed name is what `curl | sh`
+    reaches and it has to keep moving; the versioned one is what a release can be
+    held to after that name has moved on to the next build.
+
+    Global replace is safe because each placeholder literal appears ONLY on its
     assignment line — the "was it stamped?" guards test the value's shape
-    (^\\d+(\\.\\d+)*$), so they contain no placeholder text to corrupt.
+    (^\\d+(\\.\\d+)*$ and 64 hex chars), so they contain no placeholder text to
+    corrupt.
+
+    Returns ``(fixed, pinned)`` — both lists of written basenames.
     """
-    stamped: list[str] = []
+    fixed: list[str] = []
+    pinned: list[str] = []
     for rel in STAMP_INSTALL_SCRIPTS:
         src = repo_root / rel
         if not src.exists():
             print(f"  [skip] {rel} not found")
             continue
         text = src.read_text(encoding="utf-8")
-        new_text = text.replace(VERSION_PLACEHOLDER, version)
+        new_text = text.replace(VERSION_PLACEHOLDER, version).replace(
+            ZIP_SHA256_PLACEHOLDER, zip_sha256
+        )
         # newline="\n" on purpose: the default would translate LF to CRLF on
         # Windows, and a CRLF install.sh makes sh fail on Linux/macOS
         # (`]\r: command not found` from the very first `[ ... ]` test).
         # Only the basename lands in out_dir: the scripts live in scripts/ at
         # the repo root but are stamped into dist/ as a flat upload set.
+
         (out_dir / src.name).write_text(new_text, encoding="utf-8", newline="\n")
-        stamped.append(src.name)
-    return stamped
+        fixed.append(src.name)
+        # Same string, second path: the copy cannot drift from the entry point
+        # because there is only ever one write of the stamped text.
+        alias = versioned_name(version, zip_sha256, src.suffix)
+        (out_dir / alias).write_text(new_text, encoding="utf-8", newline="\n")
+        pinned.append(alias)
+    return fixed, pinned
 
 
-def make_zip(file_list: list[tuple[Path, str]], zip_path: Path) -> None:
+def make_zip(file_list: list[tuple[Path, str]], zip_path: Path,
+             date_time: tuple[int, int, int, int, int, int]) -> None:
+    """Write the archive, choosing every field that would otherwise come from
+    the machine rather than from the tree.
+
+    A ``ZipInfo`` is built per entry because ``zf.write()`` derives three things
+    from the filesystem: the timestamp (source mtime), the permission bits
+    (on-disk mode, i.e. the packer's umask) and nothing else we care about.  All
+    three are set explicitly here — see the block comment above entry_epoch().
+    """
     zip_path.parent.mkdir(parents=True, exist_ok=True)
-    with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED, compresslevel=6) as zf:
+    with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
         for src, arc in file_list:
-            # ZipFile.write() returns None — only writestr() returns a ZipInfo.
-            zf.write(src, arcname=arc)
-            if arc in EXEC_ARCS:
-                # fetching it back is fine: the central directory (where
-                # external_attr lives) is only serialized on close()
-                zf.getinfo(arc).external_attr = 0o755 << 16
+            info = zipfile.ZipInfo(arc, date_time=date_time)
+            info.compress_type = zipfile.ZIP_DEFLATED
+            info.external_attr = (0o755 if arc in EXEC_ARCS else 0o644) << 16
+            # ... and the level: on this write path zipfile reads it off the
+            # ZipInfo, defaulting to zlib's own default.  ZipFile(compresslevel=)
+            # is what ZipFile.write() copies onto the info it builds for itself;
+            # naming the value here keeps the archive compressed the same way it
+            # always was, instead of silently switching to -1.
+            info._compresslevel = _COMPRESS_LEVEL
+            with zf.open(info, "w") as dst, open(src, "rb") as handle:
+                shutil.copyfileobj(handle, dst, 1024 * 1024)
+        # Nothing is appended after the tree: an informational file in the zip
+        # was a claim about the build with no reader (`packed` was the last
+        # survivor), and every edit to it moved the entry count this packer
+        # verifies.  The build's identity is the file NAME — version plus the
+        # digest prefix — and everything else is the bytes themselves.
 
 
 def verify_zip(zip_path: Path, expected_entries: int) -> None:
@@ -621,7 +990,6 @@ def main() -> None:
     ha_version = read_ha_version(repo_root)
     out_dir = (repo_root / "dist").resolve()
 
-    print(f"HomeAnt packager")
     print(f"  version: {version}")
     print(f"  ha:      {ha_version}")
     print(f"  repo:    {repo_root}")
@@ -636,7 +1004,8 @@ def main() -> None:
             "ERROR: installer drift — fix before packing:\n"
             + "\n".join(f"  - {p}" for p in problems)
         )
-    print("  drift:   OK (archive URL, temp name, start call, --upgrade, version var)")
+    print("  drift:   OK (archive URL, tag width, temp name, start call, "
+          "--upgrade, version var, uv release, digest placeholder, port list)")
 
     # 1. reconcile the generated constraint block (no-op when unchanged)
     pins, changed = sync_constraints(repo_root, ha_version)
@@ -662,10 +1031,16 @@ def main() -> None:
     file_list = collect_files(repo_root)
     print(f"  files:   {len(file_list)}")
 
-    # 6. stamp install scripts with version (for direct upload)
-    stamped = stamp_install_scripts(repo_root, version, out_dir)
+    # 5b. the timestamp every entry will carry, printed with its source — so a
+    #     date in `zipinfo` never has to be guessed at.  It comes from the last
+    #     commit unless SOURCE_DATE_EPOCH says otherwise; `zipinfo` will show an
+    #     even second, because the DOS field keeps seconds / 2.
+    stamp, stamp_note = entry_epoch(repo_root)
+    date_time = time.gmtime(stamp)[:6]
+    print(f"  time:    {time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime(stamp))}"
+          f" ({stamp_note})")
 
-    # 7. build versioned zip, verify it, then rename into place
+    # 6. build under a .tmp name and verify, then name and rename.
     #
     #    The .tmp name is not tidiness.  An interrupted pack leaves a zip with
     #    no central directory, and under the real name that file is a perfect
@@ -674,18 +1049,41 @@ def main() -> None:
     #    with the 0.1.1 build.  Doing the rename last means the worst case is a
     #    stray .tmp that no upload step will pick up.  A SIGKILL cannot be
     #    caught, so the ordering buys more than the check does.
-    zip_path = out_dir / f"HomeAnt-{version}.zip"
-    tmp_path = zip_path.with_name(zip_path.name + ".tmp")
-    print(f"  zip:     {zip_path.name}")
+    #
+    #    It also cannot be named yet: the name carries the digest, and the
+    #    digest does not exist until the archive is complete.
+    tmp_path = out_dir / f"HomeAnt-{version}.zip.tmp"
     try:
-        make_zip(file_list, tmp_path)
+        make_zip(file_list, tmp_path, date_time)
         verify_zip(tmp_path, len(file_list))
-        tmp_path.replace(zip_path)
     except BaseException:
         # SystemExit included: a failed check must not leave a .tmp behind for
         # someone to rename into place by hand.
         tmp_path.unlink(missing_ok=True)
         raise
+
+    # 7b. digest, then name.  Hashing the .tmp is hashing the shipped bytes:
+    #     verify_zip() has just proved the file complete — central directory
+    #     readable, every CRC matching, the entry count exact — and a rename
+    #     moves no bytes.  The digest is printed and stamped into the
+    #     installers; it is never written beside the zip, because a
+    #     `<zip>.sha256` is a second copy of a number no code reads and is free
+    #     to drift from the stamped one.
+    zip_sha256 = hashlib.sha256(tmp_path.read_bytes()).hexdigest()
+    zip_path = out_dir / arc_name(version, zip_sha256)
+    tmp_path.replace(zip_path)
+    print(f"  zip:     {zip_path.name}")
+    print(f"  sha256:  {zip_sha256}")
+
+    # 7c. stamp the installers last, now carrying both the version and that
+    #     digest, and write them into dist/ for upload — twice each, under the
+    #     fixed name and the immutable one.  Safe at this point only because they
+    #     are never inside the zip: stamping them cannot change the bytes just
+    #     hashed, so the digest and the script still describe each other.
+    fixed, pinned = stamp_install_scripts(
+        repo_root, version, out_dir, zip_sha256)
+    print(f"  install: {' '.join(fixed)}")
+    print(f"  pinned:  {' '.join(pinned)}")
 
     # 8. summary
     size_mb = zip_path.stat().st_size / 1024 / 1024
@@ -693,8 +1091,8 @@ def main() -> None:
     print(f"Done! {size_mb:.1f} MB")
     print()
     print(f"Upload to server:")
-    print(f"  core/HomeAnt-{version}.zip")
-    for name in stamped:
+    print(f"  core/{zip_path.name}")
+    for name in fixed + pinned:
         print(f"  core/{name}")
     print()
 

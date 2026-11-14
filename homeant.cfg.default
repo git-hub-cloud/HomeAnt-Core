@@ -18,11 +18,17 @@
 # tool creates: the same login drives the Xiaomi OAuth flow and owns the MCP
 # token (.mcp-token in HA_ROOT — that token carries admin rights, is written
 # 0600, and is only ever printed for you to paste into your client).
-# Provisioning is append-only: changing PASSWORD here later does NOT update it
-# — use `.venv\Scripts\hass --ignore-os-check --script auth -c %USERPROFILE%\.homeant
-# change_password <username> <new-pw>` with hass stopped.
+# This line is the authority for the password: every `start` reconciles the HA
+# account to whatever PASSWORD holds here, offline, while hass is stopped.  Edit
+# it and run `homeant start`; a password changed in the HA UI is reset back on
+# the next start, and the value is never echoed (read it from this file).
+#
+# Empty = generate.  `start` makes a 16-character password, writes it back into
+# this line and reports that it did, without printing the password itself.  It
+# generates one even when the account already exists: an empty line records
+# nothing, so leaving it empty would leave no way to know what the password is.
 USERNAME=admin
-PASSWORD=homeant
+PASSWORD=
 
 # ── Xiaomi Home plugin (XIAOMI_ prefix, auto-filled by homeant) ──
 # Accept EULA (true = skip the EULA step)
@@ -33,3 +39,28 @@ XIAOMI_CLOUD_SERVER=cn
 XIAOMI_LANGUAGE=zh-Hans
 # Network dependency check (true = homeant pings external endpoints)
 XIAOMI_NETWORK_DETECT=true
+
+# ── MQTT broker (built in; started and stopped with `homeant start` / `stop`) ──
+# Serves LAN devices (Tasmota, ESP32, anything that speaks MQTT) and HA's own
+# MQTT integration.  There is no system service and no add-on page: the broker
+# is a child of `start`, so its lifetime is this home's lifetime.
+#
+# Anonymous access is refused on purpose.  On 0.0.0.0:1883 an open broker hands
+# the whole home to anything that can reach the port, so the authentication
+# plugin is always mounted and refuses any connection it cannot verify.
+#
+# The account is NOT configured here.  It lives in HA's own MQTT integration
+# entry: the first `start` generates a 16-character password and stores it
+# there.  It is never printed — when a device (Tasmota, ESP32) asks for broker
+# credentials, read them from that entry (`.storage/core.config_entries`, the
+# `HomeAnt broker` row), or change the password in the UI (Settings → Devices &
+# services → MQTT → Reconfigure) and the broker accepts the new value on the
+# next connection, no restart.  Every account in this Home Assistant that has a
+# password can also log in to the broker.
+#
+# Editing the listener takes effect on the next `start` only — the broker reads
+# mqtt.yaml once at boot, so the way to change it is `stop` + `start`.
+#
+# Listen address: 0.0.0.0 for LAN devices, 127.0.0.1 for this machine only.
+MQTT_LISTEN=0.0.0.0
+MQTT_PORT=1883

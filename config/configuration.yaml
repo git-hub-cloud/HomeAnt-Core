@@ -18,9 +18,14 @@ history:            # history of states
 logbook:            # logbook of events
 homeant_mdns:       # mdns discovery of HomeAnt devices
 homeant_voice:      # HomeAnt voice speaker
+homeant_dlna:       # DLNA speaker bridge — signed view + play/select services
 input_select:       # UI dropdown; options filled at runtime by homeant_voice_discover_speakers
   homeant_voice_speaker:
     name: HomeAnt Voice Speaker
+    options:
+      - unset
+  homeant_dlna_speaker:
+    name: HomeAnt DLNA Speaker
     options:
       - unset
 input_text:         # Persistent record of the chosen speaker. input_select's
@@ -28,6 +33,8 @@ input_text:         # Persistent record of the chosen speaker. input_select's
                     # saved value has no matching option and falls back to unset.
   homeant_voice_speaker:
     name: HomeAnt Voice Speaker (saved)
+  homeant_dlna_speaker:
+    name: HomeAnt DLNA Speaker (saved)
 automation: !include automations.yaml
 script: !include scripts.yaml
 scene: !include scenes.yaml
