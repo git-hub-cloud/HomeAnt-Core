@@ -25,12 +25,10 @@ HOMEANT_ZIP_SHA256="__HOMEANT_ZIP_SHA256_PLACEHOLDER__"
 # short form can be wrong in the URL and the download still stops on mismatch.
 ZIP_TAG=$(printf '%s' "$HOMEANT_ZIP_SHA256" | cut -c1-8)
 ZIP_URL="https://${HOMEANT_SERVER}/core/HomeAnt-${HOMEANT_VERSION}-${ZIP_TAG}.zip"
-# uv release bootstrapped by this installer. Bump this one line: the URL below
-# and the matching CDN directory (uv/<version>/, uploaded separately - it never
-# goes into the zip) both derive from it. Keep it equal to the "uv==" pin in
-# pyproject.toml.
-UV_VERSION="0.13.6"
-UV_INSTALL_URL="https://${HOMEANT_SERVER}/uv/${UV_VERSION}/uvinstall.sh"
+# The uv bootstrap ships INSIDE the release zip at scripts/uvinstall.sh, so no
+# CDN directory is uploaded for it and no second homeant.cn request is made.
+# The file name is fixed: it carries no version. The version and its wheel URLs
+# live in the script's own embedded UVLOCK -- the only place that records them.
 CONNECT_TIMEOUT=15
 TRANSFER_TIMEOUT=600
 
@@ -522,31 +520,6 @@ download() {
         --max-time "$TRANSFER_TIMEOUT" -o "$2" "$1"
 }
 
-# --- helper: fetch a remote SCRIPT into memory and validate it ---
-# Used for scripts we then hand to an interpreter (uvinstall.sh). POSIX sh has
-# no `pipefail`, so `curl ... | sh` reports a broken download as success: curl
-# exits 22, sh reads an empty body and exits 0. Fetching into a variable first
-# fixes that (the assignment carries curl's own exit status), but one more case
-# gets through, so both checks below are load-bearing:
-#   ① curl -f  -> 4xx/5xx (rc 22)
-#   ② [ -n ]   -> 200 with a zero-byte body (empty input still runs as a no-op)
-# Not covered: 200 carrying a non-empty HTML error page / host default page.
-# Deliberately not content-checked - a keyword match proves nothing about the
-# script being correct, and it breaks the moment that copy is edited. TLS plus
-# the two checks above are the accepted trade-off (same as uv/rustup/mise).
-# Prints the script text on stdout; on failure prints the reason on stderr and
-# returns 1 (never _fatal - the caller decides the message and the exit).
-fetch_script() {   # $1=url  $2=label
-    local s
-    # $1 (the url), not $2 (the label): every other download failure on both
-    # platforms reads "download failed: <url>". The label is kept for the
-    # empty-body message below, where there is no url to blame.
-    s=$(curl -fL -sS --connect-timeout "$CONNECT_TIMEOUT" --max-time "$TRANSFER_TIMEOUT" "$1") \
-        || { err "download failed: $1"; return 1; }
-    [ -n "$s" ] || { err "downloaded $2 is empty"; return 1; }
-    printf '%s' "$s"
-}
-
 # --- helper: sha256 of a file, first tool that exists ---
 # No single tool covers the three targets: coreutils ships sha256sum on Linux,
 # macOS has only shasum (perl) plus openssl, busybox has sha256sum and no
@@ -676,16 +649,18 @@ elif command -v uv >/dev/null 2>&1; then
 else
     mkdir -p "$repo_root/.tools/uv"
     export UV_INSTALL_DIR="$repo_root/.tools/uv"
-    # fetch_script validates BEFORE a single line runs: curl -f for 4xx/5xx and
-    # a non-empty body. Without them the server answering with a 404 would be
-    # piped into sh and read as a successful install.
-    # All three failure modes say "uv install failed: <reason>", matching
-    # install.ps1, whose catch reports "uv install failed: <exception>". "aborted"
-    # was a third wording for the same event; the reason after the colon is what
-    # makes the two platforms' messages equivalent.
-    uv_script=$(fetch_script "$UV_INSTALL_URL" "uvinstall.sh") \
-        || _fatal "uv install failed: could not fetch uvinstall.sh"
-    printf '%s' "$uv_script" | sh || _fatal "uv install failed: uvinstall.sh exited $?"
+    # The bootstrap ships inside the zip we just unpacked, at
+    # scripts/uvinstall.sh. No CDN request: read the local copy and check it is
+    # non-empty before a single line runs (a missing/empty file must not read
+    # as a successful no-op install). dist-pack.py refuses to pack a tree
+    # without both bootstrap files, so a normal release cannot reach the empty
+    # case. The name is fixed -- no version to keep in sync here.
+    uv_installer="$repo_root/scripts/uvinstall.sh"
+    if [ ! -s "$uv_installer" ]; then
+        _fatal "uv install failed: missing bootstrap scripts/uvinstall.sh in this package"
+    fi
+    printf '%s' "$(cat "$uv_installer")" | sh \
+        || _fatal "uv install failed: uvinstall.sh exited $?"
     if [ -x "$repo_root/.tools/uv/uv" ]; then
         uv_bin="$repo_root/.tools/uv/uv"
     else

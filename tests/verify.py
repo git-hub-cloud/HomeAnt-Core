@@ -526,9 +526,9 @@ def _case_d16() -> str:
     # one-cause verdicts beat one three-cause list, which cannot say which
     # check failed to notice what.
     drift_cases = (
-        ("uv version bumped on one side", "scripts/install.ps1",
-         r'^\$UvVersion\s*=\s*"[^"]+"', '$UvVersion             = "0.12.23"',
-         "install.ps1"),
+        ("the release URL points at a different archive", "scripts/install.sh",
+         r'^ZIP_URL="[^"]+"', 'ZIP_URL="https://${HOMEANT_SERVER}/core/Nope.zip"',
+         "install.sh"),
         ("a real digest where the placeholder belongs", "scripts/install.sh",
          r'^HOMEANT_ZIP_SHA256="[^"]*"',
          'HOMEANT_ZIP_SHA256="%s"' % ("ab" * 32),
@@ -549,6 +549,12 @@ def _case_d16() -> str:
          r"\$HOMEANT_ZIP_SHA256\.Substring\(0, 8\)",
          "$HOMEANT_ZIP_SHA256.Substring(0, 12)",
          "install.ps1"),
+        # The uv version is now compared across pyproject's pin and both
+        # bootstraps' UVLOCK blocks. Bump one side: packing must refuse.
+        ("uv version bumped in one bootstrap", "scripts/uvinstall.sh",
+         r'(name\s*=\s*"uv"\s*\r?\n\s*version\s*=\s*")0\.13\.6(")',
+         r"\g<1>9.9.9\g<2>",
+         "uv version differs"),
     )
 
     with tempfile.TemporaryDirectory() as tmp:
@@ -556,15 +562,22 @@ def _case_d16() -> str:
         (root / "scripts").mkdir()
         for rel in copied:
             (root / rel).write_bytes((REPO_ROOT / rel).read_bytes())
-        # check 7 asks for the CDN directory, so the copy needs it to be clean
-        pyproject = (root / "pyproject.toml").read_text(encoding="utf-8")
-        uv_ver = re.search(r'"uv==([^"]+)"', pyproject)
-        assert uv_ver, "pyproject.toml no longer pins uv== — this case cannot judge"
-        (root / "uv" / uv_ver.group(1)).mkdir(parents=True)
+        # check 7 asks for the in-zip bootstrap scripts, so the copy needs them.
+        # Use the real files: their embedded UVLOCK version is what check 7 now
+        # compares to pyproject's uv pin. A stub without that block would make
+        # the untouched copy look drifted and mask the injections below.
+        for name in ("uvinstall.sh", "uvinstall.ps1"):
+            (root / "scripts" / name).write_bytes(
+                (REPO_ROOT / "scripts" / name).read_bytes()
+            )
 
         version = pack.read_version(root / "pyproject.toml")
         baseline = pack.check_drift(root, version)
-        originals = {rel: (root / rel).read_bytes() for rel in sh_ps1}
+        # Restore every injected file between cases -- the uv-version case
+        # touches a bootstrap, the others touch the installers / pyproject.
+        injected = sh_ps1 + ("pyproject.toml",
+                             "scripts/uvinstall.sh", "scripts/uvinstall.ps1")
+        originals = {rel: (root / rel).read_bytes() for rel in injected}
 
         findings: list[str] = []
         for label, rel, pattern, repl, must_name in drift_cases:
@@ -585,8 +598,7 @@ def _case_d16() -> str:
         )
     if findings:
         raise AssertionError("; ".join(findings))
-    return (f"4/4 static contracts enforced (uv {uv_ver.group(1)}, digest, "
-            f"ports, tag width)")
+    return "5/5 static contracts enforced (release URL, digest, ports, tag width, uv version)"
 
 
 # Whether a case runs its "needs a live instance" half.  Set from --live in

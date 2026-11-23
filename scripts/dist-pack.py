@@ -151,6 +151,13 @@ INCLUDE_PATHS = [
     # never runs on a user's machine, and the two installers are upload
     # artifacts — they are stamped into dist/, not shipped inside the tree.
     "scripts/homeant.py",
+    # uv bootstrap installers, one per platform. Shipped inside the zip so the
+    # online installers never have to make a second homeant.cn request. The
+    # names are FIXED -- no version in the path. The uv version lives only in
+    # each file's embedded UVLOCK, so a bump replaces the file contents and
+    # this pack list never changes. The rest of scripts/ is build tooling.
+    "scripts/uvinstall.sh",
+    "scripts/uvinstall.ps1",
     "config/",
     "core/homeassistant/",
     "core/pyproject.toml",
@@ -537,35 +544,38 @@ def check_drift(repo_root: Path, version: str) -> list[str]:
                     f"would stamp ({sample}) — a release would read as having no version"
                 )
 
-    # 7. the uv release, spelled out in four places: the lock's pin, one line
-    #    per installer, and — the only one a script cannot state — a directory
-    #    on the CDN. A bump that misses a side either fetches a uv nobody
-    #    uploaded (a 404 in the middle of an install) or leaves the tree
-    #    claiming two versions at once. `uv/<ver>/` is checked here because that
-    #    directory is the only record of "this release was prepared for upload".
-    uv_versions = {
-        label: value
-        for label, value in (
-            ("pyproject.toml", grab(pyproject, r'(?m)^\s*"uv==([^"]+)"',
-                                    "pyproject.toml uv==")),
-            ("install.sh", grab(sh, r'(?m)^UV_VERSION="([^"]+)"',
-                                "install.sh UV_VERSION")),
-            ("install.ps1", grab(ps1, r'(?m)^\$UvVersion\s*=\s*"([^"]+)"',
-                                 "install.ps1 $UvVersion")),
-        )
-        if value
-    }
-    if len(set(uv_versions.values())) > 1:
-        problems.append(
-            "uv version differs: "
-            + ", ".join(f"{k}={v}" for k, v in uv_versions.items())
-        )
-    elif uv_versions:
-        pinned = next(iter(uv_versions.values()))
-        if not (repo_root / "uv" / pinned).is_dir():
+    # 7. the two bootstrap scripts must be in the tree, and their embedded uv
+    #    version must agree with the pin pyproject.toml gives HA at runtime.
+    #    The file names are fixed; each file carries its own version inside its
+    #    UVLOCK (the only place the installers read a version from). pyproject's
+    #    `uv==` is a separate, HA-owned fact recorded in uv.lock. Nothing keeps
+    #    the two in sync automatically, so a bump that updates one but not the
+    #    other would install a uv the HA lock disagrees with — caught here,
+    #    before dist/ is touched. A missing version block is reported too: no
+    #    comparison can be claimed against a bootstrap whose version is gone.
+    uv_pin = grab(pyproject, r'(?m)^\s*"uv==([^"]+)"', "pyproject.toml uv==")
+    for name in ("uvinstall.sh", "uvinstall.ps1"):
+        bootstrap = repo_root / "scripts" / name
+        if not bootstrap.is_file():
             problems.append(
-                f"uv/{pinned}/ does not exist — both installers would fetch "
-                f"uv {pinned} from a CDN directory this tree never prepares"
+                f"scripts/{name} does not exist — the installer would look for "
+                f"this bootstrap inside the zip and not find it"
+            )
+            continue
+        embedded = re.search(
+            r'name\s*=\s*"uv"\s*\r?\n\s*version\s*=\s*"([^"]+)"',
+            bootstrap.read_text(encoding="utf-8"),
+        )
+        if not embedded:
+            problems.append(
+                f"scripts/{name}: no embedded uv version in its UVLOCK — "
+                f"cannot compare against pyproject.toml's pin"
+            )
+        elif uv_pin and embedded.group(1) != uv_pin:
+            problems.append(
+                f"uv version differs: pyproject.toml={uv_pin}, "
+                f"scripts/{name}={embedded.group(1)} — the bootstrap would "
+                f"install a uv the HA lock disagrees with"
             )
 
     # 8. the digest literal in the source tree is a placeholder and nothing
@@ -1005,7 +1015,7 @@ def main() -> None:
             + "\n".join(f"  - {p}" for p in problems)
         )
     print("  drift:   OK (archive URL, tag width, temp name, start call, "
-          "--upgrade, version var, uv release, digest placeholder, port list)")
+          "--upgrade, version var, uv bootstrap + pin, digest placeholder, port list)")
 
     # 1. reconcile the generated constraint block (no-op when unchanged)
     pins, changed = sync_constraints(repo_root, ha_version)

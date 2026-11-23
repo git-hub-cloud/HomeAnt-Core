@@ -35,12 +35,10 @@ $HOMEANT_ZIP_SHA256    = "__HOMEANT_ZIP_SHA256_PLACEHOLDER__"
 # dist-pack.py, and check_drift() refuses to pack when it does not.
 $ZipTag                = $HOMEANT_ZIP_SHA256.Substring(0, 8)
 $ZipUrl                = "https://$HomeAntServer/core/HomeAnt-${HOMEANT_VERSION}-${ZipTag}.zip"
-# uv release bootstrapped by this installer. Same role as UV_VERSION in
-# install.sh: the URL below and the CDN directory uv/<version>/ (uploaded
-# separately, never inside the zip) derive from it. Keep it equal to the
-# "uv==" pin in pyproject.toml.
-$UvVersion             = "0.13.6"
-$UvInstallUrl          = "https://$HomeAntServer/uv/${UvVersion}/uvinstall.ps1"
+# The uv bootstrap ships INSIDE the release zip at scripts/uvinstall.ps1, so no
+# CDN directory is uploaded for it and no second homeant.cn request is made.
+# The file name is fixed: it carries no version. The version and its wheel URLs
+# live in the script's own embedded UVLOCK -- the only place that records them.
 # $ConnectTimeoutSec     = 15
 $TransferTimeoutSec    = 600
 # How long _stop_hass waits for hass to exit before killing it again.  The same
@@ -785,21 +783,22 @@ function main() {
         } else {
             New-Item -ItemType Directory -Path $UvDir -Force | Out-Null
             $env:UV_INSTALL_DIR     = $UvDir
-            # Run the installer straight from the response - nothing touches disk.
-            # The body is executed through a scriptblock, i.e. in its own scope:
+            # The bootstrap ships inside the zip we just unpacked, at
+            # scripts\uvinstall.ps1 - no CDN request and no second download.
+            # The name is fixed -- no version to keep in sync here.
+            # The body still runs through a scriptblock, i.e. in its own scope:
             # every variable and function the installer defines ($app_name,
             # $UVLOCK_TOML, its timeout knobs, its functions) stays local, so it can
             # neither collide with this script's names nor leak into the caller's
-            # session. The server serves .ps1 as application/octet-stream with no
-            # charset, so decode the raw bytes as UTF-8 rather than trust .Content.
+            # session. Read as UTF-8 explicitly: the file is checked into a git
+            # tree that may be checked out by tools with different default
+            # encodings, and an installer with a mangled BOM fails at parse time.
+            $uvBootstrap = Join-Path $RepoRoot "scripts\uvinstall.ps1"
+            if (-not (Test-Path $uvBootstrap -PathType Leaf)) {
+                _fatal "uv install failed: missing bootstrap scripts/uvinstall.ps1 in this package"
+            }
             try {
-                $resp = Invoke-WebRequest -UseBasicParsing -Uri $UvInstallUrl `
-                    -TimeoutSec $TransferTimeoutSec
-                $uvInstaller = if ($resp.RawContentStream) {
-                    [System.Text.Encoding]::UTF8.GetString($resp.RawContentStream.ToArray())
-                } else {
-                    [string]$resp.Content
-                }
+                $uvInstaller = [System.IO.File]::ReadAllText($uvBootstrap, [System.Text.Encoding]::UTF8)
                 & ([scriptblock]::Create($uvInstaller))
             } catch {
                 _fatal "uv install failed: $($_.Exception.Message)"
